@@ -16,6 +16,7 @@ import { CODEX_DESKTOP_ISOLATION_ARGS, CODEX_RESTRICTED_APPS_ARGS } from './code
 
 export { codexConfigObjectFromArgs } from './codex-config-overrides.js';
 
+import { buildCodexModelCatalogArgs } from './codex-model-catalog.js';
 import { extractUserEnvTemplates, hasSupportedEnvTemplate, resolveEnvMap } from './env-map.js';
 /**
  * Codex Agent Service
@@ -596,14 +597,16 @@ export function buildCodexReasoningArgs(effortLevel: string): string[] {
 /**
  * `--config` keys whose values are part of a system-owned runtime contract.
  * Free-form cliConfigArgs may override ordinary Codex preferences, but they
- * cannot replace identity/speed controls or the model/window that an
- * invocation_config binding certifies as applied before launch.
+ * cannot replace identity/speed controls, the model/window an
+ * invocation_config binding certifies as applied before launch, or the
+ * custom-model metadata catalog injected for routed models.
  */
 const RESERVED_SYSTEM_CONFIG_KEYS: ReadonlySet<string> = new Set([
   'developer_instructions',
   'service_tier',
   'model',
   'model_context_window',
+  'model_catalog_json',
   'model_auto_compact_token_limit',
 ]);
 
@@ -1702,6 +1705,11 @@ export class CodexAgentService implements AgentService {
             `model_auto_compact_token_limit=${deriveAutoCompactTokenLimit(contextWindow)}`,
           ]
         : [];
+    // Custom-model metadata: a model without a built-in Codex catalog entry
+    // (e.g. deepseek-flash) gets our catalog file so the CLI stops falling
+    // back to generic metadata. Gated per-model because the flag replaces
+    // the entire built-in catalog.
+    const modelCatalogArgs = buildCodexModelCatalogArgs(effectiveModel);
     // #712: Inject ALL enabled MCP servers from capabilities.json at invoke time.
     const appServerHostPool = this.appServerHostPool;
     const wantsPooledAppServer =
@@ -1981,6 +1989,7 @@ export class CodexAgentService implements AgentService {
           ...dedup(modelArgs),
           ...dedup(reasoningArgs),
           ...dedup(contextWindowArgs),
+          ...dedup(modelCatalogArgs),
           ...dedup(sandboxConfigArgs),
           ...dedup(approvalArgs),
           ...dedup(appsWriteApprovalArgs),
@@ -2003,6 +2012,7 @@ export class CodexAgentService implements AgentService {
           ...dedup(modelArgs),
           ...dedup(reasoningArgs),
           ...dedup(contextWindowArgs),
+          ...dedup(modelCatalogArgs),
           ...['--sandbox', sandboxMode],
           ...(readOnly || native ? [] : ['--add-dir', '.git']),
           ...dedup(approvalArgs),
@@ -2027,6 +2037,7 @@ export class CodexAgentService implements AgentService {
             ...dedup(modelArgs),
             ...dedup(reasoningArgs),
             ...dedup(contextWindowArgs),
+            ...dedup(modelCatalogArgs),
             ...dedup(appsWriteApprovalArgs),
             ...dedup(providerArgs),
             ...userConfigArgs,
