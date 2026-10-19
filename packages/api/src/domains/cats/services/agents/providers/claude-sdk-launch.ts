@@ -124,7 +124,13 @@ export async function prepareClaudeSdkLaunch(input: {
   const settings = plan?.ready
     ? composeManagedSettingsDocument(plan, accountSettings, options?.workingDirectory)
     : accountSettings;
-  const overrides = { ...buildClaudeEnvOverrides(options?.callbackEnv), ...options?.accountEnv };
+  const overrides = {
+    ...buildClaudeEnvOverrides(options?.callbackEnv, {
+      contextNativeWindowTokens: options?.contextNativeWindowTokens,
+      contextCapacity: options?.contextCapacity,
+    }),
+    ...options?.accountEnv,
+  };
   if (options?.callbackEnv?.[ANTHROPIC_PROFILE_MODE_KEY] === 'subscription')
     for (const key of SUBSCRIPTION_MODE_DENY_KEYS) overrides[key] = null;
   applyClaudeTokenAccountEnv(overrides, options?.claudeTokenAccount);

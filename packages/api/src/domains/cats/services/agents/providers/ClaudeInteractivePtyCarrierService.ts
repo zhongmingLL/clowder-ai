@@ -166,7 +166,10 @@ export class ClaudeInteractivePtyCarrierService implements AgentService {
       [ANTHROPIC_PROFILE_MODE_KEY]: 'subscription',
       ...(options?.callbackEnv ?? {}),
     };
-    const envOverrides = buildClaudeEnvOverrides(callbackEnvWithMode);
+    const envOverrides = buildClaudeEnvOverrides(callbackEnvWithMode, {
+      contextNativeWindowTokens: options?.contextNativeWindowTokens,
+      contextCapacity: options?.contextCapacity,
+    });
     if (options?.accountEnv) {
       for (const [k, v] of Object.entries(options.accountEnv)) {
         envOverrides[k] = v;

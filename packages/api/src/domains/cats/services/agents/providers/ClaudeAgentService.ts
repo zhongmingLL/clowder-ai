@@ -243,8 +243,30 @@ function removePreCompactSettingsTempDir(path: string | undefined): void {
  * - Windows git bash path resolution
  * - subscription mode → strip all ANTHROPIC_* (avoid silent api_key billing)
  * - api_key mode → inject ANTHROPIC_API_KEY / BASE_URL / model override
+ * - unknown third-party models → inject CLAUDE_CODE_MAX_CONTEXT_TOKENS from
+ *   member config, because the CLI otherwise assumes its 200k default window
  */
-export function buildClaudeEnvOverrides(callbackEnv?: Record<string, string>): Record<string, string | null> {
+export interface ClaudeEnvWindowOptions {
+  /** #1381: raw/native provider window owned by member config. `null` = do not inject. */
+  contextNativeWindowTokens?: number | null;
+  /** Legacy callers without an invocation snapshot fall back to the effective window. */
+  contextCapacity?: { windowTokens: number } | null;
+}
+
+function resolveClaudeNativeWindowTokens(windowOptions?: ClaudeEnvWindowOptions): number | undefined {
+  const nativeWindowTokens =
+    windowOptions?.contextNativeWindowTokens !== undefined
+      ? windowOptions.contextNativeWindowTokens
+      : windowOptions?.contextCapacity?.windowTokens;
+  return nativeWindowTokens != null && Number.isFinite(nativeWindowTokens) && nativeWindowTokens > 0
+    ? nativeWindowTokens
+    : undefined;
+}
+
+export function buildClaudeEnvOverrides(
+  callbackEnv?: Record<string, string>,
+  windowOptions?: ClaudeEnvWindowOptions,
+): Record<string, string | null> {
   const env: Record<string, string | null> = { ...(callbackEnv ?? {}) };
 
   env.CLAUDECODE = null;
@@ -280,6 +302,19 @@ export function buildClaudeEnvOverrides(callbackEnv?: Record<string, string>): R
     const effectiveModel = modelOverride || undefined;
     if (effectiveModel && !isKnownAnthropicModel(effectiveModel)) {
       env.ANTHROPIC_MODEL = effectiveModel;
+
+      // Claude CLI only knows its native model names; for any other model it
+      // falls back to a 200k window and starts auto-compacting. With the MCP
+      // tool schema alone costing ~175k tokens, that leaves ~25k for the
+      // conversation and guarantees compaction thrashing. Pass the window the
+      // member config declares so the CLI budgets against the real model.
+      // #1381: prefer the RAW/native window — the effective/pinned capacity is
+      // downstream and feeding it back would recurse. Explicit null means this
+      // invocation has no config-owned window and nothing may be injected.
+      const nativeWindowTokens = resolveClaudeNativeWindowTokens(windowOptions);
+      if (nativeWindowTokens !== undefined) {
+        env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(nativeWindowTokens);
+      }
     }
   } else if (mode === 'subscription') {
     // Subscription mode must not inherit shell-level Anthropic credentials.
@@ -616,7 +651,10 @@ export class ClaudeAgentService implements AgentService {
       }
 
       let sawResultError = false;
-      const envOverrides = buildClaudeEnvOverrides(options?.callbackEnv);
+      const envOverrides = buildClaudeEnvOverrides(options?.callbackEnv, {
+        contextNativeWindowTokens: options?.contextNativeWindowTokens,
+        contextCapacity: options?.contextCapacity,
+      });
       // F171: Account env vars applied LAST — user overrides provider-injected values
       if (options?.accountEnv) {
         for (const [k, v] of Object.entries(options.accountEnv)) envOverrides[k] = v;
