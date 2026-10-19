@@ -142,6 +142,7 @@ if [ "\${1:-}" = "install" ] && [ "\${2:-}" = "--no-frozen-lockfile" ]; then
   exit 0
 fi
 if [ "\${1:-}" = "run" ] && [ "\${2:-}" = "build" ]; then
+  printf '%s|%s\\n' "$target_dir" "\${NODE_OPTIONS-<unset>}" >> "$log_file.env"
   case "$target_dir" in
     */packages/shared)
       mkdir -p "$target_dir/dist"
@@ -651,7 +652,7 @@ server.listen(3010,'127.0.0.1',()=>setInterval(()=>{},1000));`,
 
   it('rebuilds missing quick-start artifacts before start', () => {
     const projectDir = createTempProject('runtime-self-heal-quick-build');
-    const env = withStubbedPnpmEnv(projectDir);
+    const env = { ...withStubbedPnpmEnv(projectDir), NODE_OPTIONS: '' };
     seedRuntimeDependencyMarkers(projectDir);
 
     const result = spawnRuntimeStart(projectDir, ['--no-sync', '--', '--quick'], {
@@ -672,6 +673,11 @@ server.listen(3010,'127.0.0.1',()=>setInterval(()=>{},1000));`,
     assert.match(pnpmLog, /-C .*packages\/api run build/);
     assert.match(pnpmLog, /-C .*packages\/mcp-server run build/);
     assert.match(pnpmLog, /-C .*packages\/web run build/);
+    assert.match(
+      readFileSync(`${env.RUNTIME_TEST_PNPM_LOG}.env`, 'utf8'),
+      /packages\/web\|--max-old-space-size=3072/,
+      'web production build must default to a larger Node heap before next build',
+    );
   });
 
   it('starts in-place when .git is a dangling pointer file', () => {

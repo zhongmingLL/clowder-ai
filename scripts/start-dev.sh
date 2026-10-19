@@ -1431,9 +1431,15 @@ compile_packages() {
     for package in "${built_packages[@]}"; do
         echo ""
         echo -e "${CYAN}构建 $package...${NC}"
+        local build_command=(run_in_dir "$PROJECT_DIR/packages/$package" pnpm run build)
+        if [ "$package" = "web" ]; then
+            # next build is the memory peak; keep the same default as install.sh.
+            build_command=(run_in_dir "$PROJECT_DIR/packages/$package" env \
+                NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=3072}" pnpm run build)
+        fi
         # Explicitly propagate failure in the new compiler shell: it does not
         # inherit the launcher's errexit, and a later echo must not hide status.
-        if run_logged_step "$package 构建" 10 run_in_dir "$PROJECT_DIR/packages/$package" pnpm run build; then
+        if run_logged_step "$package 构建" 10 "${build_command[@]}"; then
             echo -e "${GREEN}  ✓ $package 构建完成${NC}"
         else
             rc=$?

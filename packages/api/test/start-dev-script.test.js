@@ -187,6 +187,43 @@ printf 'ok'
   assert.equal(output, 'ok');
 });
 
+test('web build defaults to a larger Node heap when NODE_OPTIONS is unset', () => {
+  const projectDir = mkdtempSync(join(tmpdir(), 'cat-cafe-start-dev-web-heap-'));
+  const binDir = join(projectDir, 'bin');
+  const logPath = join(projectDir, 'pnpm-build.log');
+  try {
+    for (const packageName of ['shared', 'mcp-server', 'api', 'web']) {
+      mkdirSync(join(projectDir, 'packages', packageName), { recursive: true });
+    }
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(
+      join(binDir, 'pnpm'),
+      `#!/bin/bash\nprintf '%s|%s\\n' "$PWD" "$NODE_OPTIONS" >> "${logPath}"\n`,
+      { mode: 0o755 },
+    );
+
+    const scriptPath = resolve(process.cwd(), '../../scripts/start-dev.sh');
+    runSourceOnlySnippet(
+      scriptPath,
+      `PROJECT_DIR="${projectDir}"\nPROD_WEB=true\ncompile_packages`,
+      { PATH: `${binDir}:${process.env.PATH ?? ''}`, NODE_OPTIONS: '' },
+    );
+
+    const builds = readFileSync(logPath, 'utf8').trim().split('\n');
+    assert.equal(builds.length, 4);
+    for (const build of builds) {
+      const [cwd, nodeOptions] = build.split('|');
+      assert.equal(
+        nodeOptions,
+        cwd.endsWith('/packages/web') ? '--max-old-space-size=3072' : '',
+        `unexpected NODE_OPTIONS for ${cwd}`,
+      );
+    }
+  } finally {
+    rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
 test('start-dev auto-install clears inherited production install env', () => {
   const scriptPath = resolve(process.cwd(), '../../scripts/start-dev.sh');
   const scriptText = readFileSync(scriptPath, 'utf8');

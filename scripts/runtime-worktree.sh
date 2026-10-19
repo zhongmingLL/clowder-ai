@@ -371,7 +371,8 @@ ensure_runtime_dist_freshness() {
   if needs_rebuild "$RUNTIME_DIR/packages/web/.next/BUILD_ID" \
       "$RUNTIME_DIR/packages/web/.next/.build-commit" "$head_commit"; then
     info "runtime dist: web production build stale/missing; running pnpm -C \"$RUNTIME_DIR/packages/web\" run build"
-    pnpm -C "$RUNTIME_DIR/packages/web" run build
+    NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=3072}" \
+      pnpm -C "$RUNTIME_DIR/packages/web" run build
     record_build_stamp "$RUNTIME_DIR/packages/web/.next/.build-commit" "$head_commit"
   fi
 }
