@@ -19,6 +19,13 @@
  * the custom-model launch byte-identical to today's fallback behavior instead
  * of forking to a different (e.g. GPT-5) template.
  *
+ * The snapshot above is the RAW fallback. When the invocation does not enable
+ * `tools.update_plan`, `buildCodexModelCatalogFileContent` applies the CLI's
+ * own `without_update_plan_instructions` filter before embedding it, keeping
+ * the catalog request at the 16,979-character adapted template the CLI would
+ * have sent on the no-catalog path. The sha256 above pins the raw snapshot;
+ * the filter has separate parity fixtures in the catalog test.
+ *
  * Why not read it at runtime: `codex debug models --bundled` exposes only the
  * built-in per-model templates (11 in 0.163.0); none matches this fallback
  * text, and the CLI has no command that renders `BASE_INSTRUCTIONS`. Runtime

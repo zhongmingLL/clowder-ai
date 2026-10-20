@@ -14,18 +14,25 @@
  * custom entry get it; builtin models must never receive it.
  *
  * The catalog's `instructions_template` is the CLI's own captured fallback text
- * (see ./codex-model-catalog-instructions.ts) so the model receives exactly the
- * same instructions it got under fallback metadata.
+ * (see ./codex-model-catalog-instructions.ts), adapted with the same
+ * `without_update_plan_instructions` filter the CLI applies to its fallback
+ * metadata. This cannot be left to the CLI: `get_prompt_base_instructions`
+ * skips that filter whenever `model_catalog` is set, so injecting the raw
+ * prompt would tell a model to call an `update_plan` tool that the invocation
+ * does not expose.
  *
  * The entries also carry the model's native `context_window` /
  * `max_context_window`. That is not cosmetic: Codex's own fallback metadata
  * pins both to 272_000, and `with_config_overrides` computes
- * `min(--config model_context_window, max_context_window)`, so an injected 1M
+ * `min(--config model_context_window, max_context_window)`, so a configured
  * window silently collapsed to 272_000 (reported usable: 258_400 = 272_000 x
- * 95%). Declaring the member-configured native window here is what lets the
- * configured value survive. This is a metadata declaration, not a claim that
- * the backend accepted a 1M-token request: the CLI-reported 950_000 usable
- * value is `1M x 95%`, and actual backend acceptance remains unverified.
+ * 95%). The values are per invocation and come from the invocation's resolved
+ * native window (member manual/catalog config). They are omitted when that
+ * source is absent, preserving Codex's "unconfigured" semantics instead of
+ * promoting one member's manual 1M setting to every same-named route. This is
+ * a metadata declaration, not a claim that the backend accepted a 1M-token
+ * request: the CLI-reported 950_000 usable value is `1M x 95%`, and actual
+ * backend acceptance remains unverified.
  *
  * Scope: only the `exec_json` carrier receives this catalog. It is the carrier
  * where we both inject the per-invocation member window and have independent
@@ -35,8 +42,18 @@
  * matching config path. Keep it out until that carrier has its own evidence.
  */
 
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { normalizeModelSlug } from '@cat-cafe/shared';
@@ -52,16 +69,16 @@ export interface CodexModelCatalogEntry {
   slug: string;
   display_name: string;
   /**
-   * Native window advertised by the model. Required: Codex reads
-   * `context_window` straight from this entry, and an absent value leaves
-   * invocations without a `model_context_window` override reporting
-   * `model_context_window: null` (no window awareness at all). Declaring it
-   * also makes `max_context_window` a real ceiling for
-   * `--config model_context_window=<smaller>`, instead of a clamp to the
-   * 272k fallback that silently reduced a configured 1M window to 258k usable.
+   * Native window owned by THIS invocation. Optional: when the invocation has
+   * no config-owned native window, both fields are omitted so Codex keeps
+   * reporting `model_context_window: null` instead of inheriting a value from
+   * another member or route. When present, Codex reads `context_window`
+   * directly, and `max_context_window` must equal it so
+   * `--config model_context_window=<native>` is not clamped by the 272k
+   * fallback (which silently reduced a configured 1M window to 258k usable).
    */
-  context_window: number;
-  max_context_window: number;
+  context_window?: number;
+  max_context_window?: number;
   supported_reasoning_levels: Array<{ effort: string; description: string }>;
   shell_type: string;
   visibility: string;
@@ -96,8 +113,6 @@ export const CODEX_CUSTOM_MODEL_CATALOG_ENTRIES: Readonly<Record<string, CodexMo
   'deepseek-flash': {
     slug: 'deepseek-flash',
     display_name: 'DeepSeek Flash',
-    context_window: 1_000_000,
-    max_context_window: 1_000_000,
     supported_reasoning_levels: DEEPSEEK_FLASH_REASONING_LEVELS,
     shell_type: 'shell_command',
     visibility: 'hide',
@@ -113,9 +128,112 @@ export const CODEX_CUSTOM_MODEL_CATALOG_ENTRIES: Readonly<Record<string, CodexMo
   },
 };
 
-/** Serialized catalog file content (stable: entries are module constants). */
-export function buildCodexModelCatalogFileContent(): string {
-  return `${JSON.stringify({ models: Object.values(CODEX_CUSTOM_MODEL_CATALOG_ENTRIES) }, null, 2)}\n`;
+export interface CodexModelCatalogBuildOptions {
+  /**
+   * Raw/native window owned by THIS invocation (member manual/catalog config).
+   * `null`/`undefined` means no config-owned window: omit the window fields so
+   * Codex keeps reporting `model_context_window: null` instead of inheriting a
+   * value from another member or route.
+   */
+  nativeContextWindowTokens?: number | null;
+  /** Codex's `tools.update_plan.enabled` setting for this invocation. */
+  updatePlanEnabled?: boolean;
+  /** Carrier gate; only `exec_json` receives the catalog. */
+  carrier?: CodexModelCatalogCarrier;
+}
+
+const UPDATE_PLAN_SECTION_HEADINGS = new Set([
+  '## Planning',
+  '## `update_plan`',
+  '## Plan tool',
+  '## Plan Mode vs update_plan tool',
+]);
+
+function findSectionEnd(lines: readonly string[], headerIndex: number): number {
+  for (let next = headerIndex + 1; next < lines.length; next++) {
+    if (lines[next].startsWith('# ') || lines[next].startsWith('## ')) return next;
+  }
+  return lines.length;
+}
+
+function isChecklistSection(
+  lines: readonly string[],
+  headerIndex: number,
+  sectionEnd: number,
+  heading: string,
+): boolean {
+  if (heading !== '## Planning') return true;
+  return lines
+    .slice(headerIndex, sectionEnd)
+    .some(
+      (candidate) =>
+        candidate.startsWith('You have access to an `update_plan` tool') ||
+        candidate.startsWith('When `update_plan` is available, follow this section'),
+    );
+}
+
+function skipIndentedContinuation(lines: readonly string[], index: number): number {
+  let next = index;
+  while (next < lines.length && (lines[next].startsWith(' ') || lines[next].startsWith('\t'))) {
+    next += 1;
+  }
+  return next;
+}
+
+/**
+ * Port of `codex-rs/prompts/src/update_plan_instructions.rs`. Codex applies
+ * this filter to fallback instructions when `tools.update_plan` is disabled,
+ * but deliberately skips it when a model catalog is present. We must apply the
+ * same semantics ourselves before embedding the template in the catalog.
+ */
+export function withoutUpdatePlanInstructions(instructions: string): string {
+  const lines = instructions.split(/(?<=\n)/);
+  const rendered: string[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index].trimEnd();
+    if (UPDATE_PLAN_SECTION_HEADINGS.has(line)) {
+      const end = findSectionEnd(lines, index);
+      if (isChecklistSection(lines, index, end, line)) {
+        index = end;
+        continue;
+      }
+    }
+
+    if (line === 'Progress visibility:' && lines[index + 1]?.startsWith('If update_plan is available')) {
+      index += 2;
+      if (lines[index]?.trim() === '') index += 1;
+      continue;
+    }
+
+    if (line.startsWith('- Use the plan tool ') || line.startsWith('- If you create a checklist or task list,')) {
+      index = skipIndentedContinuation(lines, index + 1);
+      continue;
+    }
+
+    rendered.push(lines[index]);
+    index += 1;
+  }
+  return rendered.join('');
+}
+
+/**
+ * Serialized catalog file content for one invocation. The instructions
+ * template is adapted to the invocation's actual tool set, and the window
+ * fields are present only when this invocation owns a native window.
+ */
+export function buildCodexModelCatalogFileContent(options: CodexModelCatalogBuildOptions = {}): string {
+  const windowTokens = options.nativeContextWindowTokens;
+  const hasNativeWindow = typeof windowTokens === 'number' && Number.isFinite(windowTokens) && windowTokens > 0;
+  const instructions = options.updatePlanEnabled
+    ? CODEX_FALLBACK_MODEL_INSTRUCTIONS
+    : withoutUpdatePlanInstructions(CODEX_FALLBACK_MODEL_INSTRUCTIONS);
+  const models = Object.values(CODEX_CUSTOM_MODEL_CATALOG_ENTRIES).map((entry) => ({
+    ...entry,
+    ...(hasNativeWindow ? { context_window: windowTokens, max_context_window: windowTokens } : {}),
+    model_messages: { instructions_template: instructions },
+  }));
+  return `${JSON.stringify({ models }, null, 2)}\n`;
 }
 
 /** True when the effective model is one this module owns metadata for. */
@@ -140,13 +258,14 @@ export function resolveCodexModelCatalogPath(content: string): string {
  */
 export function buildCodexModelCatalogArgs(
   model: string | null | undefined,
-  carrier: CodexModelCatalogCarrier = 'exec_json',
+  options: CodexModelCatalogBuildOptions = {},
 ): string[] {
+  const carrier = options.carrier ?? 'exec_json';
   if (carrier !== 'exec_json') return [];
   const slug = normalizeModelSlug(model);
   if (!slug || !(slug in CODEX_CUSTOM_MODEL_CATALOG_ENTRIES)) return [];
   try {
-    const content = buildCodexModelCatalogFileContent();
+    const content = buildCodexModelCatalogFileContent(options);
     const path = resolveCodexModelCatalogPath(content);
     materializeCodexModelCatalog(content, path);
     return ['--config', `model_catalog_json=${path}`];
@@ -159,10 +278,43 @@ export function buildCodexModelCatalogArgs(
   }
 }
 
+/**
+ * Reuse the content-addressed file only after proving it is exactly the bytes
+ * this invocation requested. A matching filename alone proves nothing: a
+ * truncated or hand-edited file made the CLI exit with a JSON parse error and
+ * never fall back. `O_NOFOLLOW` keeps the read from following a planted link;
+ * a mismatch is rebuilt atomically over the path.
+ */
+function isIntactCatalogFile(path: string, expectedContent: string): boolean {
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ELOOP') return false;
+    throw err;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return false;
+    return readFileSync(fd, 'utf8') === expectedContent;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function materializeCodexModelCatalog(content: string, path: string): void {
-  if (existsSync(path)) return;
-  mkdirSync(dirname(path), { recursive: true });
-  const tmpPath = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmpPath, content, 'utf8');
-  renameSync(tmpPath, path);
+  if (isIntactCatalogFile(path, content)) return;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const tmpPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tmpPath, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    renameSync(tmpPath, path);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Best-effort cleanup; the original failure is what matters.
+    }
+    throw err;
+  }
 }
