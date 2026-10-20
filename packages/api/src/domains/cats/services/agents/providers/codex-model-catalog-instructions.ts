@@ -1,23 +1,37 @@
 /**
- * Verbatim copy of the Codex CLI fallback instructions text (captured from a
- * live `codex exec` request for a model without built-in catalog metadata —
- * deepseek-flash, codex-cli 0.147.0, 2026-10-14).
+ * Verbatim copy of the Codex CLI's base fallback instructions.
+ *
+ * Source (pinned):
+ *   repo:   openai/codex
+ *   tag:    rust-v0.163.0
+ *   path:   codex-rs/models-manager/prompt.md
+ *   sha256: ebfcbdce4a6c353e85d6cde37e508b89c77a902bd27771c91caba5fd494bdb83
+ *           (of the text without its trailing LF)
+ *
+ * `models-manager/src/model_info.rs` embeds that file as `BASE_INSTRUCTIONS`
+ * and hands it to every unknown slug via `model_info_from_slug()` ->
+ * `local_model_messages()`. The upstream file ends with one LF; the request
+ * `instructions` field does not, so this copy removes exactly that byte.
  *
  * Why embed: `--config model_catalog_json=...` REPLACES the built-in catalog,
  * and the custom entry's `model_messages.instructions_template` is what Codex
- * sends as the request 'instructions' field. Embedding the captured fallback
- * text keeps the custom-model launch byte-identical to today's fallback
- * behavior instead of forking to a different (e.g. GPT-5) template.
+ * sends as the request `instructions` field. Embedding the fallback text keeps
+ * the custom-model launch byte-identical to today's fallback behavior instead
+ * of forking to a different (e.g. GPT-5) template.
  *
- * Regenerate: capture the 'instructions' field of a codex exec request for a
- * model with fallback metadata through a local capture proxy, then rebuild
- * this file with the same line-array shape.
+ * Why not read it at runtime: `codex debug models --bundled` exposes only the
+ * built-in per-model templates (11 in 0.163.0); none matches this fallback
+ * text, and the CLI has no command that renders `BASE_INSTRUCTIONS`. Runtime
+ * extraction would need a capture proxy, so this stays a pinned, hash-checked
+ * asset with a reproducible upgrade path instead of a live CLI read.
+ *
+ * Upgrade: run `node scripts/sync-codex-fallback-instructions.mjs --version
+ * <codex version> --write`, then update the sha256 above and the length /
+ * hash assertions in `test/codex-model-catalog.test.js`.
  *
  * Invariant: the joined text is 20_750 characters, byte-identical to the
- * fallback template extracted from the codex-cli 0.163.0 binary (0.163.0 is
- * also the version the catalog replacement semantics were re-verified on).
- * A join separator other than a bare newline breaks this silently, so the
- * separator has its own regression test.
+ * 0.163.0 fallback template. A join separator other than a bare newline breaks
+ * this silently, so the separator has its own regression test.
  */
 
 /* eslint-disable */

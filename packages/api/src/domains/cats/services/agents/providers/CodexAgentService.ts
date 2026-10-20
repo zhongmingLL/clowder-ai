@@ -16,7 +16,7 @@ import { CODEX_DESKTOP_ISOLATION_ARGS, CODEX_RESTRICTED_APPS_ARGS } from './code
 
 export { codexConfigObjectFromArgs } from './codex-config-overrides.js';
 
-import { buildCodexModelCatalogArgs } from './codex-model-catalog.js';
+import { buildCodexModelCatalogArgs, isCodexCustomCatalogModel } from './codex-model-catalog.js';
 import { extractUserEnvTemplates, hasSupportedEnvTemplate, resolveEnvMap } from './env-map.js';
 /**
  * Codex Agent Service
@@ -1709,7 +1709,9 @@ export class CodexAgentService implements AgentService {
     // (e.g. deepseek-flash) gets our catalog file so the CLI stops falling
     // back to generic metadata. Gated per-model because the flag replaces
     // the entire built-in catalog.
-    const modelCatalogArgs = buildCodexModelCatalogArgs(effectiveModel);
+    const modelCatalogArgs = buildCodexModelCatalogArgs(effectiveModel, carrierMode);
+    const catalogRequested = carrierMode === 'exec_json' && isCodexCustomCatalogModel(effectiveModel);
+    const catalogApplied = modelCatalogArgs.length > 0;
     // #712: Inject ALL enabled MCP servers from capabilities.json at invoke time.
     const appServerHostPool = this.appServerHostPool;
     const wantsPooledAppServer =
@@ -2222,6 +2224,10 @@ export class CodexAgentService implements AgentService {
           cwd: options?.workingDirectory ?? null,
           authMode,
           argCount: args.length,
+          // Distinguish "builtin model / app_server (not applicable)" from
+          // "custom model requested the catalog but materialization fell back".
+          modelCatalog: catalogApplied ? 'applied' : catalogRequested ? 'fallback' : 'not_applicable',
+          requestedContextWindow: contextWindow ?? null,
           // Log flag names + --config keys (no values) for debugging
           cliFlags: args.filter((a) => a.startsWith('-')),
           cliConfigKeys: args.map((a, i) => (args[i - 1] === '--config' ? a.split('=')[0] : null)).filter(Boolean),
