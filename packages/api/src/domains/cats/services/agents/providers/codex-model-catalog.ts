@@ -16,6 +16,14 @@
  * The catalog's `instructions_template` is the CLI's own captured fallback text
  * (see ./codex-model-catalog-instructions.ts) so the model receives exactly the
  * same instructions it got under fallback metadata.
+ *
+ * The entries also carry the model's native `context_window` /
+ * `max_context_window`. That is not cosmetic: Codex's own fallback metadata
+ * pins both to 272_000, and `with_config_overrides` computes
+ * `min(--config model_context_window, max_context_window)`, so an injected 1M
+ * window silently collapsed to 272_000 (reported usable: 258_400 = 272_000 x
+ * 95%). Declaring the real window here is what lets the configured value
+ * survive.
  */
 
 import { createHash } from 'node:crypto';
@@ -28,6 +36,17 @@ import { CODEX_FALLBACK_MODEL_INSTRUCTIONS } from './codex-model-catalog-instruc
 export interface CodexModelCatalogEntry {
   slug: string;
   display_name: string;
+  /**
+   * Native window advertised by the model. Required: Codex reads
+   * `context_window` straight from this entry, and an absent value leaves
+   * invocations without a `model_context_window` override reporting
+   * `model_context_window: null` (no window awareness at all). Declaring it
+   * also makes `max_context_window` a real ceiling for
+   * `--config model_context_window=<smaller>`, instead of a clamp to the
+   * 272k fallback that silently reduced a configured 1M window to 258k usable.
+   */
+  context_window: number;
+  max_context_window: number;
   supported_reasoning_levels: Array<{ effort: string; description: string }>;
   shell_type: string;
   visibility: string;
@@ -56,6 +75,8 @@ export const CODEX_CUSTOM_MODEL_CATALOG_ENTRIES: Readonly<Record<string, CodexMo
   'deepseek-flash': {
     slug: 'deepseek-flash',
     display_name: 'DeepSeek Flash',
+    context_window: 1_000_000,
+    max_context_window: 1_000_000,
     supported_reasoning_levels: DEEPSEEK_FLASH_REASONING_LEVELS,
     shell_type: 'shell_command',
     visibility: 'hide',

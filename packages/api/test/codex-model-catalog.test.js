@@ -174,6 +174,8 @@ describe('codex custom-model catalog injection', () => {
     const requiredFields = [
       'slug',
       'display_name',
+      'context_window',
+      'max_context_window',
       'supported_reasoning_levels',
       'shell_type',
       'visibility',
@@ -196,5 +198,32 @@ describe('codex custom-model catalog injection', () => {
       parsed.models.map((item) => item.slug).sort(),
       Object.keys(CODEX_CUSTOM_MODEL_CATALOG_ENTRIES).sort(),
     );
+  });
+
+  // Codex pins both windows to 272_000 for models missing from its own catalog
+  // and then applies `min(--config model_context_window, max_context_window)`,
+  // so a configured 1M window was silently clamped to 272_000 (258_400 usable).
+  // The entry must therefore declare the native window, and it must reach the
+  // serialized file — a value readable only from the typed constant would not
+  // change what the CLI sees.
+  test('custom entries declare the native window that the CLI actually clamps against', () => {
+    const parsed = JSON.parse(buildCodexModelCatalogFileContent());
+    for (const item of parsed.models) {
+      assert.equal(
+        item.context_window,
+        1_000_000,
+        `entry ${item.slug} must advertise the native 1M window`,
+      );
+      assert.equal(
+        item.max_context_window,
+        1_000_000,
+        `entry ${item.slug} must not lower the configurable ceiling (Codex clamps with min())`,
+      );
+      assert.equal(
+        item.context_window,
+        item.max_context_window,
+        `entry ${item.slug} default window must equal its ceiling`,
+      );
+    }
   });
 });
