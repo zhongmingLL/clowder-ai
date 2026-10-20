@@ -426,6 +426,59 @@ describe('codex custom-model catalog injection', () => {
     assert.equal(template.length, 20_750, 'enabled update_plan must use the raw pinned template');
   });
 
+  test('service resolves update_plan from the final CLI override, including parent-table replacement', async () => {
+    const cases = [
+      {
+        name: 'later duplicate leaf disables',
+        args: ['-c tools.update_plan.enabled=true', '-c tools.update_plan.enabled=false'],
+        enabled: false,
+      },
+      {
+        name: 'later duplicate leaf enables',
+        args: ['-c tools.update_plan.enabled=false', '-c tools.update_plan.enabled=true'],
+        enabled: true,
+      },
+      {
+        name: 'parent table replacement disables',
+        args: ['-c tools.update_plan.enabled=true', '-c tools={update_plan={enabled=false}}'],
+        enabled: false,
+      },
+      {
+        name: 'parent table replacement drops the leaf',
+        args: ['-c tools.update_plan.enabled=true', '-c tools={other={enabled=true}}'],
+        enabled: false,
+      },
+    ];
+
+    for (const [index, entry] of cases.entries()) {
+      const proc = createMockProcess();
+      const spawnFn = createDeferredSpawnFn(proc, `t-catalog-update-plan-final-${index}`);
+      const service = new CodexAgentService({
+        l0CompilerFn: fakeL0Compiler,
+        spawnFn,
+        catId: 'runtime-sol',
+        model: 'deepseek-flash',
+      });
+
+      await collect(service.invoke('hello', { cliConfigArgs: entry.args }));
+
+      const args = spawnFn.mock.calls[0].arguments[1];
+      const path = findCatalogPath(args);
+      assert.ok(path, `${entry.name}: catalog flag missing from argv: ${JSON.stringify(args)}`);
+      const template = JSON.parse(readFileSync(path, 'utf8')).models[0].model_messages.instructions_template;
+      assert.equal(
+        template.includes('update_plan'),
+        entry.enabled,
+        `${entry.name}: template must follow the CLI's final update_plan visibility`,
+      );
+      assert.equal(
+        template.length,
+        entry.enabled ? 20_750 : 16_979,
+        `${entry.name}: template must match the CLI-adapted fallback text`,
+      );
+    }
+  });
+
   test('rebuilds a corrupted content-addressed cache file instead of trusting its name', () => {
     withIsolatedCatalogTmpdir((root) => {
       const options = { nativeContextWindowTokens: 200_000 };
