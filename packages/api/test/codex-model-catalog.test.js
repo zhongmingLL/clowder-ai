@@ -9,6 +9,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
@@ -18,9 +19,8 @@ import { fakeL0Compiler } from './helpers/fake-l0-compiler.js';
 const { CodexAgentService: ProductionCodexAgentService } = await import(
   '../dist/domains/cats/services/agents/providers/CodexAgentService.js'
 );
-const { CODEX_CUSTOM_MODEL_CATALOG_ENTRIES, buildCodexModelCatalogFileContent } = await import(
-  '../dist/domains/cats/services/agents/providers/codex-model-catalog.js'
-);
+const { CODEX_CUSTOM_MODEL_CATALOG_ENTRIES, buildCodexModelCatalogArgs, buildCodexModelCatalogFileContent } =
+  await import('../dist/domains/cats/services/agents/providers/codex-model-catalog.js');
 
 class CodexAgentService extends ProductionCodexAgentService {
   constructor(options = {}) {
@@ -217,32 +217,44 @@ describe('codex custom-model catalog injection', () => {
     for (const item of parsed.models) {
       const template = item.model_messages.instructions_template;
       assert.equal(typeof template, 'string', `entry ${item.slug} must carry a template`);
-      assert.ok(
-        !template.includes("'\n'"),
-        'template must not contain a quote-wrapped join separator',
-      );
-      assert.ok(
-        !/(?:^|\n)'|'(?:\n|$)/.test(template),
-        'no line may start or end with a stray quote',
-      );
+      assert.ok(!template.includes("'\n'"), 'template must not contain a quote-wrapped join separator');
+      assert.ok(!/(?:^|\n)'|'(?:\n|$)/.test(template), 'no line may start or end with a stray quote');
       // Byte-identical to the fallback template extracted from codex-cli
       // 0.163.0. A different join separator changes this length silently.
-      assert.equal(
-        template.length,
-        20_750,
-        'template must stay byte-identical to the CLI fallback text',
-      );
+      assert.equal(template.length, 20_750, 'template must stay byte-identical to the CLI fallback text');
     }
+  });
+
+  // The snapshot is a pinned upstream asset, not a hand-maintained paraphrase:
+  // openai/codex rust-v0.163.0 codex-rs/models-manager/prompt.md with its single
+  // trailing LF removed. If this hash changes, update the source pin and the
+  // sync script output together.
+  test('fallback instructions snapshot matches the pinned upstream source hash', () => {
+    const parsed = JSON.parse(buildCodexModelCatalogFileContent());
+    const template = parsed.models[0].model_messages.instructions_template;
+    assert.equal(
+      createHash('sha256').update(template, 'utf8').digest('hex'),
+      'ebfcbdce4a6c353e85d6cde37e508b89c77a902bd27771c91caba5fd494bdb83',
+      'fallback instructions must stay byte-identical to the pinned upstream prompt.md',
+    );
+  });
+
+  test('does not inject the catalog on the app_server carrier', () => {
+    assert.deepEqual(
+      buildCodexModelCatalogArgs('deepseek-flash', 'app_server'),
+      [],
+      'app_server does not receive the per-invocation window override, so it must not get the catalog',
+    );
+    assert.ok(
+      buildCodexModelCatalogArgs('deepseek-flash', 'exec_json').length > 0,
+      'exec_json must still receive the catalog',
+    );
   });
 
   test('custom entries declare the native window that the CLI actually clamps against', () => {
     const parsed = JSON.parse(buildCodexModelCatalogFileContent());
     for (const item of parsed.models) {
-      assert.equal(
-        item.context_window,
-        1_000_000,
-        `entry ${item.slug} must advertise the native 1M window`,
-      );
+      assert.equal(item.context_window, 1_000_000, `entry ${item.slug} must advertise the native 1M window`);
       assert.equal(
         item.max_context_window,
         1_000_000,
