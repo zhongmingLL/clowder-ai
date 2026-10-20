@@ -15,7 +15,11 @@ import {
   stopDaemon,
   writeDaemonState,
 } from './lib/daemon-state.mjs';
-import { captureReadableIdentity } from './lib/process-identity.mjs';
+import {
+  captureReadableIdentity,
+  compareStoredIdentity,
+  PROCESS_START_TIME_FORMAT,
+} from './lib/process-identity.mjs';
 
 /**
  * F300 daemon identity: an unreadable argv is "unknown", never "a different
@@ -124,6 +128,58 @@ test('capture reports an unreadable argv as unavailable rather than as a command
   assert.equal(readable.argvAvailable, true);
   assert.match(readable.command, /--cat-cafe-daemon-token=capture-token/);
   assert.equal(typeof readable.ucomm, 'string');
+});
+
+const STABLE_MARKER_TOKEN = '--cat-cafe-daemon-token=stable-marker-token';
+
+function stableMarkerFixture(overrides = {}) {
+  return {
+    startedAt: 'Tue Oct 20 16:01:27 2026',
+    startedAtEpochMs: 1792512087000,
+    startedAtFormat: PROCESS_START_TIME_FORMAT,
+    command: `node daemon.js ${STABLE_MARKER_TOKEN}`,
+    cwd: '/runtime',
+    argvAvailable: true,
+    procStartTicks: 123456,
+    bootId: 'boot-a',
+    ...overrides,
+  };
+}
+
+test('a stable /proc birth marker takes precedence over a shifted wall-clock lstart', () => {
+  const state = {
+    process: {
+      ...stableMarkerFixture({ startedAt: 'Tue Oct 20 00:36:57 2026', startedAtEpochMs: 1792456617000 }),
+      launchToken: 'stable-marker-token',
+    },
+  };
+  const live = stableMarkerFixture({ startedAt: 'Tue Oct 20 16:01:27 2026' });
+
+  assert.equal(compareStoredIdentity(state, live), 'match');
+});
+
+test('a different stable birth marker remains a conclusive mismatch', () => {
+  const state = {
+    process: {
+      ...stableMarkerFixture({ startedAt: 'Tue Oct 20 00:36:57 2026', procStartTicks: 999999 }),
+      launchToken: 'stable-marker-token',
+    },
+  };
+  const live = stableMarkerFixture();
+
+  assert.equal(compareStoredIdentity(state, live), 'mismatch');
+});
+
+test('an unreadable argv with a matching stable marker stays unknown, not mismatched', () => {
+  const state = {
+    process: {
+      ...stableMarkerFixture({ startedAt: 'Tue Oct 20 00:36:57 2026' }),
+      launchToken: 'stable-marker-token',
+    },
+  };
+  const live = stableMarkerFixture({ command: '(node)', argvAvailable: false });
+
+  assert.equal(compareStoredIdentity(state, live), 'unknown');
 });
 
 test('writing state re-reads a transiently unreadable argv instead of calling it a mismatch', async () => {

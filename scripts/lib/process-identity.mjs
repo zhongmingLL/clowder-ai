@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readlinkSync, realpathSync } from 'node:fs';
+import { readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { isProcessRunning } from './process-tree.mjs';
 
@@ -31,6 +31,38 @@ function stableProcessStart(pid, runPs) {
   const startedAtEpochMs = Date.parse(`${startedAt} UTC`);
   if (!Number.isSafeInteger(startedAtEpochMs)) throw new Error(`Cannot parse process start time for PID ${pid}`);
   return { startedAt, startedAtEpochMs };
+}
+
+/**
+ * Linux has a birth identity that does not follow the wall clock: field 22 of
+ * /proc/<pid>/stat counts clock ticks since boot, and boot_id distinguishes
+ * reboots. `ps lstart` is derived from the current wall clock, so a host
+ * suspend/resume with a clock jump changes it for an unchanged process - a
+ * production deployment was refused with `process-identity-mismatch` that way.
+ *
+ * Undefined on non-Linux hosts and whenever the files are unreadable: callers
+ * keep the ps-based fallback rather than guessing.
+ */
+function readProcBirth(pid) {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closingParen = stat.lastIndexOf(')');
+    if (closingParen < 0) return undefined;
+    // After the comm field: state is field 3, so starttime (field 22) is [19].
+    const fields = stat.slice(closingParen + 2).trim().split(/\s+/);
+    const procStartTicks = Number(fields[19]);
+    if (!Number.isSafeInteger(procStartTicks) || procStartTicks < 0) return undefined;
+    let bootId;
+    try {
+      bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || undefined;
+    } catch {
+      bootId = undefined;
+    }
+    return { procStartTicks, ...(bootId ? { bootId } : {}) };
+  } catch {
+    return undefined;
+  }
 }
 
 function processCwd(pid) {
@@ -65,6 +97,7 @@ export function captureProcessIdentity(pid, { runPs = readPsField } = {}) {
   if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`Invalid PID: ${pid}`);
   process.kill(pid, 0);
   const { startedAt, startedAtEpochMs } = stableProcessStart(pid, runPs);
+  const procBirth = readProcBirth(pid);
   const commandEnv = { ...process.env, LC_ALL: 'C' };
   const command = runPs(pid, 'command', commandEnv);
   if (!startedAt || !command) throw new Error(`Cannot inspect PID ${pid}`);
@@ -76,6 +109,7 @@ export function captureProcessIdentity(pid, { runPs = readPsField } = {}) {
     ucomm: runPs(pid, 'ucomm', commandEnv),
     argvAvailable: !isArgvUnavailable(command),
     cwd: processCwd(pid),
+    ...(procBirth ?? {}),
   };
 }
 
@@ -170,6 +204,21 @@ export function spawnedIdentityRefusal(pid, identity, expectedRoot, launchToken)
   };
 }
 
+/**
+ * @returns {true|false|undefined} true/false when both sides carry the stable
+ * Linux marker; undefined when either side predates it (or runs on macOS).
+ */
+export function compareStableBirth(stored, identity) {
+  if (!Number.isSafeInteger(stored?.procStartTicks) || !Number.isSafeInteger(identity?.procStartTicks)) {
+    return undefined;
+  }
+  if (stored.procStartTicks !== identity.procStartTicks) return false;
+  const storedBootId = typeof stored.bootId === 'string' ? stored.bootId : '';
+  const currentBootId = typeof identity.bootId === 'string' ? identity.bootId : '';
+  if (storedBootId && currentBootId && storedBootId !== currentBootId) return false;
+  return true;
+}
+
 function identityMatches(state, identity) {
   const stored = state.process;
   if (!stored || !stored.startedAt || stored.cwd !== identity.cwd) return false;
@@ -178,18 +227,22 @@ function identityMatches(state, identity) {
   if (stored.launchToken != null && !hasLaunchToken) return false;
   if (hasLaunchToken && !identity.command.includes(`${TOKEN_ARG}${stored.launchToken}`)) return false;
 
+  const stableBirth = compareStableBirth(stored, identity);
+  if (stableBirth === false) return false;
+
+  // A launch token is generated per launch and is an exact-incarnation proof
+  // on its own; lstart is not, because it follows the wall clock and can move
+  // after suspend/resume. Pre-format states already relied on this token.
+  if (hasLaunchToken) return true;
+
   if (stored.startedAtFormat !== undefined) {
-    const stableBirthMatches =
+    const legacyBirthMatches =
       stored.startedAtFormat === PROCESS_START_TIME_FORMAT &&
       identity.startedAtFormat === PROCESS_START_TIME_FORMAT &&
       stored.startedAt === identity.startedAt &&
       stored.startedAtEpochMs === identity.startedAtEpochMs;
-    if (!stableBirthMatches) return false;
-    if (hasLaunchToken) return true;
+    if (!legacyBirthMatches) return false;
   }
-
-  // A pre-format token-bound v1 state still has an exact-incarnation launch token.
-  if (hasLaunchToken) return true;
 
   // Tokenless migration is safe only when its whole start-time bucket predates the state.
   const stateWrittenAt = Date.parse(state.launchedAt);
@@ -212,6 +265,9 @@ export function compareStoredIdentity(state, identity) {
   if (identity?.argvAvailable !== false) return identityMatches(state, identity) ? 'match' : 'mismatch';
   const stored = state.process;
   if (!stored || stored.cwd !== identity.cwd) return 'mismatch';
+  const stableBirth = compareStableBirth(stored, identity);
+  if (stableBirth === false) return 'mismatch';
+  if (stableBirth === true) return 'unknown';
   const bothStable = Number.isSafeInteger(stored.startedAtEpochMs) && Number.isSafeInteger(identity.startedAtEpochMs);
   if (bothStable && stored.startedAtEpochMs !== identity.startedAtEpochMs) return 'mismatch';
   return 'unknown';
