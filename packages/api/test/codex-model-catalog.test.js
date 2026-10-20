@@ -206,6 +206,35 @@ describe('codex custom-model catalog injection', () => {
   // The entry must therefore declare the native window, and it must reach the
   // serialized file — a value readable only from the typed constant would not
   // change what the CLI sees.
+  // Regression for a P1 caught in review: the line array was joined with
+  // "'\n'" (quote + newline + quote) instead of "\n", so every one of the 274
+  // line boundaries carried a stray pair of quotes into the system prompt that
+  // is sent on every deepseek-flash invocation. The catalog file is what the
+  // CLI actually reads, so assert on the serialized artifact rather than the
+  // typed constant.
+  test('fallback instructions template survives serialization byte-identically', () => {
+    const parsed = JSON.parse(buildCodexModelCatalogFileContent());
+    for (const item of parsed.models) {
+      const template = item.model_messages.instructions_template;
+      assert.equal(typeof template, 'string', `entry ${item.slug} must carry a template`);
+      assert.ok(
+        !template.includes("'\n'"),
+        'template must not contain a quote-wrapped join separator',
+      );
+      assert.ok(
+        !/(?:^|\n)'|'(?:\n|$)/.test(template),
+        'no line may start or end with a stray quote',
+      );
+      // Byte-identical to the fallback template extracted from codex-cli
+      // 0.163.0. A different join separator changes this length silently.
+      assert.equal(
+        template.length,
+        20_750,
+        'template must stay byte-identical to the CLI fallback text',
+      );
+    }
+  });
+
   test('custom entries declare the native window that the CLI actually clamps against', () => {
     const parsed = JSON.parse(buildCodexModelCatalogFileContent());
     for (const item of parsed.models) {
