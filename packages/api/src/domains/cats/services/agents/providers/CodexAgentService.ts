@@ -662,6 +662,24 @@ function configKey(expression: string): string {
   return (equalsIndex === -1 ? expression : expression.slice(0, equalsIndex)).trim();
 }
 
+/** Mirrors Codex's `tools.update_plan.enabled` resolution for this invocation. */
+function isCodexUpdatePlanEnabled(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const parsed = parseCodexConfigArg(args, index);
+    if (!parsed) continue;
+    index += parsed.tokenCount - 1;
+    if (configKey(parsed.expression) !== 'tools.update_plan.enabled') continue;
+    const equalsIndex = parsed.expression.indexOf('=');
+    if (equalsIndex === -1) return false;
+    const value = parsed.expression
+      .slice(equalsIndex + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
+    return value.toLowerCase() === 'true';
+  }
+  return false;
+}
+
 /** Parse every documented/accepted spelling of Codex's model value flag. */
 function parseCodexModelArg(args: readonly string[], index: number): { form: string; tokenCount: 1 | 2 } | null {
   const arg = args[index];
@@ -1713,13 +1731,6 @@ export class CodexAgentService implements AgentService {
             `model_auto_compact_token_limit=${deriveAutoCompactTokenLimit(contextWindow)}`,
           ]
         : [];
-    // Custom-model metadata: a model without a built-in Codex catalog entry
-    // (e.g. deepseek-flash) gets our catalog file so the CLI stops falling
-    // back to generic metadata. Gated per-model because the flag replaces
-    // the entire built-in catalog.
-    const modelCatalogArgs = buildCodexModelCatalogArgs(effectiveModel, carrierMode);
-    const catalogRequested = carrierMode === 'exec_json' && isCodexCustomCatalogModel(effectiveModel);
-    const catalogApplied = modelCatalogArgs.length > 0;
     // #712: Inject ALL enabled MCP servers from capabilities.json at invoke time.
     const appServerHostPool = this.appServerHostPool;
     const wantsPooledAppServer =
@@ -1787,6 +1798,21 @@ export class CodexAgentService implements AgentService {
         userFlagSet.add(userConfigArgs[i]);
       }
     }
+    // Custom-model metadata: a model without a built-in Codex catalog entry
+    // (e.g. deepseek-flash) gets our catalog file so the CLI stops falling
+    // back to generic metadata. Gated per-model because the flag replaces
+    // the entire built-in catalog. The window is bound to THIS invocation's
+    // resolved native window (#1381) rather than a module-wide constant, and
+    // the instructions template is adapted to the tools this invocation
+    // actually exposes because Codex skips its own filter once a catalog is
+    // present.
+    const modelCatalogArgs = buildCodexModelCatalogArgs(effectiveModel, {
+      carrier: carrierMode,
+      nativeContextWindowTokens: nativeWindowTokens,
+      updatePlanEnabled: isCodexUpdatePlanEnabled(userConfigArgs),
+    });
+    const catalogRequested = carrierMode === 'exec_json' && isCodexCustomCatalogModel(effectiveModel);
+    const catalogApplied = modelCatalogArgs.length > 0;
     const authMode =
       options?.codexAccountLaunch?.authMode ??
       (nativeTool && !options?.callbackEnv?.CODEX_AUTH_MODE ? 'auto' : getCodexAuthMode(options?.callbackEnv));
@@ -2235,6 +2261,7 @@ export class CodexAgentService implements AgentService {
           // "custom model requested the catalog but materialization fell back".
           modelCatalog: catalogApplied ? 'applied' : catalogRequested ? 'fallback' : 'not_applicable',
           requestedContextWindow: contextWindow ?? null,
+          catalogContextWindow: catalogApplied && nativeWindowTokens != null ? nativeWindowTokens : null,
           // Log flag names + --config keys (no values) for debugging
           cliFlags: args.filter((a) => a.startsWith('-')),
           cliConfigKeys: args.map((a, i) => (args[i - 1] === '--config' ? a.split('=')[0] : null)).filter(Boolean),
