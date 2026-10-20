@@ -47,7 +47,6 @@ function makeThreadState(messages: ChatMessage[]): ThreadState {
     catStatuses: {},
     catStatusDetails: {},
     catInvocations: {},
-    currentGame: null,
     unreadCount: 0,
     hasUserMention: false,
     lastActivity: Date.now(),
@@ -194,6 +193,38 @@ describe('useChatHistory scroll memory (#27)', () => {
     act(() => useChatStore.getState().setCurrentThread(threadA));
     act(() => flushAnimationFrames());
     expect(top.get()).toBe(200);
+  });
+
+  it('places an incoming cached timeline before its first animation frame', async () => {
+    const threadA = 'thread-first-paint-a';
+    const threadB = 'thread-first-paint-b';
+    const aMessages = [makeMsg('first-paint-a', 1)];
+    const bMessages = [makeMsg('first-paint-b', 2)];
+    useChatStore.setState({
+      currentThreadId: threadA,
+      messages: aMessages,
+      hasMore: false,
+      isLoadingHistory: false,
+      threadStates: {
+        [threadA]: makeThreadState(aMessages),
+        [threadB]: makeThreadState(bMessages),
+      },
+    });
+    await act(async () => root.render(React.createElement(HookHost, { threadId: threadA })));
+    const el = capturedHook!.scrollContainerRef.current!;
+    const top = defineMutableNumberProp(el, 'scrollTop', 300);
+    defineMutableNumberProp(el, 'clientHeight', 600);
+    defineMutableNumberProp(el, 'scrollHeight', 1800);
+    cancelInitialRestoreWithWheel(el, -1);
+
+    await act(async () => {
+      useChatStore.getState().setCurrentThread(threadB);
+      root.render(React.createElement(HookHost, { threadId: threadB }));
+    });
+
+    // The outgoing offset points into the new timeline's deferred placeholders.
+    // Waiting for RAF would expose them for the first paint of the new thread.
+    expect(top.get()).toBe(1200);
   });
 
   it('retries saved offset restore until the remounted thread becomes scrollable again', async () => {
@@ -1152,7 +1183,7 @@ describe('useChatHistory scroll memory (#27)', () => {
 
     const scrollEl = capturedHook!.scrollContainerRef.current!;
     const scrollTop = defineMutableNumberProp(scrollEl, 'scrollTop', 400);
-    defineMutableNumberProp(scrollEl, 'clientHeight', 600);
+    const clientHeight = defineMutableNumberProp(scrollEl, 'clientHeight', 600);
     defineMutableNumberProp(scrollEl, 'scrollHeight', 1000);
     const endEl = capturedHook!.messagesEndRef.current!;
     endEl.scrollIntoView = vi.fn(() => {
@@ -1165,6 +1196,7 @@ describe('useChatHistory scroll memory (#27)', () => {
       capturedHook?.handleScroll();
     });
 
+    clientHeight.set(540);
     act(() => {
       window.dispatchEvent(new Event('catcafe:chat-layout-changed'));
       flushAnimationFrames();
@@ -1172,6 +1204,11 @@ describe('useChatHistory scroll memory (#27)', () => {
 
     expect(endEl.scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto' });
     expect(scrollTop.get()).toBe(460);
+    act(() => {
+      window.dispatchEvent(new Event('catcafe:chat-layout-changed'));
+      flushAnimationFrames();
+    });
+    expect(endEl.scrollIntoView).toHaveBeenCalledTimes(1);
   });
 
   it('turns a widget disclosure into an offset anchor instead of following the old bottom anchor', async () => {

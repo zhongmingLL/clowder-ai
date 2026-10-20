@@ -1,8 +1,12 @@
 'use client';
 
+import type { MediaContextAttachment } from '@cat-cafe/shared';
 import type { MessageContent } from '@/stores/chatStore';
 import { API_URL } from '@/utils/api-client';
+import { AuthenticatedMediaImage } from './AuthenticatedMediaImage';
 import { ContextAttachmentView } from './ContextAttachmentView';
+import { GalleryAttachmentGroup } from './content-review/GalleryAttachmentGroup';
+import { sameGalleryGroup } from './content-review/media-chat-selection';
 import { useChatArtworkLightbox } from './content-review/useChatArtworkLightbox';
 import type { PublishedMessageCoordinate } from './content-review/usePublishedContent';
 import { MarkdownContent } from './MarkdownContent';
@@ -40,6 +44,7 @@ export function ContentBlocks({
 }) {
   const published = useChatArtworkLightbox(publication);
   let fileQuoteNumber = 0;
+  const renderedGalleryAttachments = new Set<string>();
   return (
     <>
       {fallbackText?.trim() && !blocks.some((block) => block.type === 'text') ? (
@@ -50,28 +55,28 @@ export function ContentBlocks({
           return <MarkdownContent key={i} content={block.text} />;
         }
         if (block.type === 'image') {
-          const src = resolveUrl(block.url, published.isV2);
           const source = published.source(block.url, { kind: 'content-block', index: i });
           return (
-            <button
-              type="button"
+            <AuthenticatedMediaImage
+              url={resolveUrl(block.url, published.isV2)}
+              alt="附件"
               key={i}
-              disabled={published.busy}
-              aria-label={source ? '打开作品 图片' : '查看附件'}
               className="block max-w-full sm:max-w-sm rounded-lg mt-2 border border-cafe hover:opacity-90 transition-opacity"
-              onClick={() =>
-                void published.enlarge({
-                  url: src,
-                  title: '图片',
-                  alt: 'attached image',
-                  mediaType: 'image',
-                  entry: source,
-                })
+              onOpen={
+                published.busy
+                  ? undefined
+                  : (src) => {
+                      void published.enlarge({
+                        url: src,
+                        title: '图片',
+                        alt: 'attached image',
+                        mediaType: 'image',
+                        entry: source,
+                        item: { kind: 'content-block', index: i },
+                      });
+                    }
               }
-            >
-              {/* biome-ignore lint/performance/noImgElement: original uploaded dimensions are unknown at the chat entry */}
-              <img src={src} alt="附件" className="max-w-full rounded-lg" />
-            </button>
+            />
           );
         }
         if (block.type === 'file') {
@@ -90,6 +95,7 @@ export function ContentBlocks({
                     alt: block.fileName,
                     mediaType: block.mimeType.startsWith('video/') ? 'video' : 'image',
                     entry: source,
+                    item: { kind: 'content-block', index: i },
                   })
                 }
                 className="mt-2 flex max-w-sm items-center gap-2 rounded-lg border border-cafe bg-cafe-surface px-3 py-2 text-left hover:border-cafe-accent"
@@ -118,6 +124,20 @@ export function ContentBlocks({
           );
         }
         if (block.type === 'context_attachment') {
+          const attachment = block.attachment;
+          if (attachment.kind === 'media' && attachment.gallery) {
+            if (renderedGalleryAttachments.has(attachment.id)) return null;
+            const group = blocks.flatMap((item) =>
+              item.type === 'context_attachment' &&
+              item.attachment.kind === 'media' &&
+              item.attachment.gallery &&
+              sameGalleryGroup(attachment.gallery!, item.attachment.gallery)
+                ? [item.attachment]
+                : [],
+            ) satisfies MediaContextAttachment[];
+            for (const member of group) renderedGalleryAttachments.add(member.id);
+            return <GalleryAttachmentGroup key={attachment.id} attachments={group} />;
+          }
           const quoteNumber =
             block.attachment.kind === 'quote' && block.attachment.source.kind === 'workspace_file'
               ? ++fileQuoteNumber

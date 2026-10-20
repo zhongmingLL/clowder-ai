@@ -87,7 +87,7 @@ export type {
   ManagedCommandCancelTarget,
 } from './active-execution.js';
 // F178 Phase B: agent-key record + verify result
-export type { AgentKeyRecord, AgentKeyVerifyResult } from './agent-key.js';
+export type { AgentKeyRecord, AgentKeyScope, AgentKeyVerifyResult } from './agent-key.js';
 // F178 Phase B: agent-key reason taxonomy
 export {
   AGENT_KEY_FAILURE_REASONS,
@@ -308,6 +308,12 @@ export {
   legacyAccountFamilyForRef,
   protocolForClient,
 } from './client-routing.js';
+// F202 h3c-1: refusals of a thread cloud-binding write that prove nothing was written
+export {
+  CLOUD_BINDING_REFUSALS,
+  type CloudBindingRefusal,
+  isCloudBindingRefusal,
+} from './cloud-binding-refusals.js';
 export type {
   CloudBridgeDomFingerprintV1,
   CloudBridgeFailureDiagnosticV1,
@@ -530,8 +536,6 @@ export {
   DISTILLATION_SOURCE_EVENTS,
   isDistillationSourceEvent,
 } from './dossier-distillation.js';
-// F233 Phase A: 值班简报 DTO (pure-projection aggregator output; impl stays in api)
-export type { BallEntry, BallEntryKind, DutyBriefing, DutyBriefingCounts } from './duty-briefing.js';
 // Entity proposal types (F260 Phase A 实体治理)
 export type {
   EntityConflictContext,
@@ -660,35 +664,6 @@ export type {
   FrustrationSignalType,
 } from './frustration-issue.js';
 export { createFrustrationIssue, generateFrustrationIssueId } from './frustration-issue.js';
-// Game engine types (F101)
-export type {
-  ActionDefinition,
-  ActionStatus,
-  ActorType,
-  Ballot,
-  EventScope,
-  GameAction,
-  GameConfig,
-  GameDefinition,
-  GameEvent,
-  GameResultStats,
-  GameRuntime,
-  GameView,
-  PendingAction,
-  PhaseDefinition,
-  Resolution,
-  RoleDefinition,
-  Seat,
-  SeatId,
-  SeatView,
-  WinCondition,
-} from './game.js';
-export {
-  isGameEvent,
-  isSeatId,
-  isValidActionStatus,
-  isValidScope,
-} from './game.js';
 export {
   type AwaitStateV1,
   commentAudienceForPerspective,
@@ -948,6 +923,7 @@ export {
   MARKETPLACE_ECOSYSTEMS,
   TRUST_LEVELS,
 } from './marketplace.js';
+export { type MediaGalleryOrigin, mediaGalleryOriginSchema } from './media-context-attachment.js';
 // Meeting types (F195 Phase C — Meeting Copilot)
 export type {
   MeetingParticipant,
@@ -1348,6 +1324,10 @@ export type {
   PluginManagerSetEnabledRequest,
   PluginManagerUninstallRequest,
   PluginManifest,
+  PluginMarketplaceSelection,
+  PluginOperationRow,
+  PluginOperationRowAction,
+  PluginOperationRows,
   PluginResourceDef,
   PluginResourceStatus,
   PluginStatus,
@@ -1358,6 +1338,7 @@ export {
   pluginDescriptionVariants,
   resolvePluginDescription,
 } from './plugin.js';
+export type { PluginWaitState, PluginWaitUpdate } from './plugin-wait.js';
 export {
   DEFERRED_PERSON_MEMORY_CLERK_DISPOSITIONS,
   DEFERRED_PERSON_MEMORY_RECEIPT_STATES,
@@ -1719,6 +1700,7 @@ export type {
   GlobalArtifactDTO,
   GlobalArtifactsResponse,
   GlobalArtifactWork,
+  GlobalWorksPageResponse,
   ThreadArtifactDTO,
   ThreadArtifactsResponse,
   ThreadArtifactType,
@@ -1769,6 +1751,7 @@ export type {
   TurnOutputFenceVerdict,
 } from './turn-execution.js';
 export * from './unified-attention.js';
+export * from './unified-attention-decision.js';
 // User preferences types (F166 猫猫排序自定义)
 export type {
   MessageDispositionPreferenceSnapshot,

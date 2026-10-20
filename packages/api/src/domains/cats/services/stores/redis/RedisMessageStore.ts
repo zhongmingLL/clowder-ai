@@ -16,6 +16,7 @@ import {
 import { withOwnerUncertaintyIndex } from './owner-uncertainty-lua.js';
 import { readOwnerUncertainty } from './owner-uncertainty-read.js';
 import { recordRedisCompanionAcceptance } from './redis-companion-acceptance.js';
+import { artifactMessageHash, MESSAGE_ARTIFACT_FIELDS } from './redis-message-artifact-fields.js';
 import { evidenceMessageHash, MESSAGE_EVIDENCE_FIELDS } from './redis-message-evidence-fields.js';
 import {
   HANDLE_USER_MENTIONS_LUA,
@@ -69,6 +70,7 @@ import {
 } from '../../agents/invocation/queue-ledger/RedisQueueLedgerStore.js';
 import { cursorFor, parseCursor } from '../cursor.js';
 import type { LifecycleAppendRecoveryInput, LifecycleAppendRecoveryResult } from '../lifecycle-append-recovery.js';
+import type { LifecycleWakeCoverageInput, LifecycleWakeCoverageResult } from '../lifecycle-wake-coverage.js';
 import { messageFrom } from '../message-from.js';
 import { notifyMessageTimelineChange } from '../notify-message-timeline-change.js';
 import type {
@@ -150,6 +152,7 @@ import {
 } from '../visibility.js';
 import { HUMAN_SOURCE_HASH_LUA, humanSourceHash } from './redis-human-source-hash.js';
 import { commitRedisLifecycleAppendRecovery } from './redis-lifecycle-append-recovery.js';
+import { commitRedisLifecycleWakeCoverage } from './redis-lifecycle-wake-coverage.js';
 import { appendMessage } from './redis-message-append.js';
 import { CANCEL_LUA, REASSIGN_LUA } from './redis-message-delivery-lua-scripts.js';
 import { appendMessageAndObservePriorFrontier } from './redis-message-frontier-append.js';
@@ -1832,8 +1835,13 @@ export class RedisMessageStore {
       // APPEND_WITH_VISIBILITY_LUA will reclaim it atomically (#1210).
     }
 
-    const id = reservedId ?? generateSortableId(msg.timestamp);
-    const { idempotencyKey, ...payload } = msg;
+    if (msg.reservedId !== undefined && !/^\d{16}-\d{6,}-[0-9a-f]{8}$/.test(msg.reservedId))
+      throw new TypeError('reserved message id has invalid shape');
+    if (reservedId !== undefined && msg.reservedId !== undefined && reservedId !== msg.reservedId)
+      throw new Error('reserved message id conflict');
+    const id = reservedId ?? msg.reservedId ?? generateSortableId(msg.timestamp);
+    const { idempotencyKey, reservedId: mediaReservedId, ...payload } = msg;
+    void mediaReservedId;
     void idempotencyKey;
     const stored: StoredMessage = {
       ...payload,
@@ -3324,7 +3332,10 @@ export class RedisMessageStore {
       }
 
       if (validIds.length > 0) {
-        const messages = await this.hydrateMessages(validIds);
+        const messages = await this.hydrateMessages(
+          validIds,
+          options?.artifactProjection ? { artifactOnly: true, strict: true } : undefined,
+        );
         storageRoundTrips += 1;
         for (const message of messages) {
           if (!isVisible(message)) continue;
@@ -3387,39 +3398,6 @@ export class RedisMessageStore {
   }
 
   /**
-   * Fetch IDs before a composite cursor (timestamp + beforeId) using chunked scanning.
-   * Loops until we have `limit` results or exhaust the sorted set.
-   */
-  private async fetchBeforeWithCursor(
-    key: string,
-    timestamp: number,
-    beforeId: string,
-    limit: number,
-  ): Promise<string[]> {
-    const CHUNK = 50;
-    const filtered: string[] = [];
-    let offset = 0;
-
-    while (filtered.length < limit) {
-      const chunk = await this.redis.zrevrangebyscore(key, String(timestamp), '-inf', 'LIMIT', offset, CHUNK);
-      if (chunk.length === 0) break;
-
-      for (const id of chunk) {
-        if (filtered.length >= limit) break;
-        const score = await this.redis.zscore(key, id);
-        if (score !== null && parseRedisNumber(score) === timestamp && id >= beforeId) {
-          continue;
-        }
-        filtered.push(id);
-      }
-
-      offset += CHUNK;
-    }
-
-    return filtered;
-  }
-
-  /**
    * Scan before a cursor (desc), hydrate + apply visibility + optional extra,
    * collecting exactly N visible messages or until sorted set exhaustion.
    * Returns messages in desc order (newest first). Caller must reverse for asc.
@@ -3437,14 +3415,24 @@ export class RedisMessageStore {
     let offset = 0;
 
     while (result.length < n) {
-      const chunk = await this.redis.zrevrangebyscore(key, String(timestamp), '-inf', 'LIMIT', offset, CHUNK);
-      if (chunk.length === 0) break;
+      const chunk = await this.redis.zrevrangebyscore(
+        key,
+        String(timestamp),
+        '-inf',
+        'WITHSCORES',
+        'LIMIT',
+        offset,
+        CHUNK,
+      );
+      const memberCount = chunk.length / 2;
+      if (memberCount === 0) break;
 
-      // Filter cursor boundary (same logic as fetchBeforeWithCursor)
+      // Bind the boundary to the timeline score returned with each member.
       const validIds: string[] = [];
-      for (const id of chunk) {
-        const score = await this.redis.zscore(key, id);
-        if (score !== null && parseRedisNumber(score) === timestamp && id >= beforeId) {
+      for (let i = 0; i < chunk.length; i += 2) {
+        const id = chunk[i]!;
+        const score = parseRedisNumber(chunk[i + 1]!);
+        if (score === timestamp && id >= beforeId) {
           continue;
         }
         validIds.push(id);
@@ -3461,8 +3449,8 @@ export class RedisMessageStore {
         }
       }
 
-      if (chunk.length < CHUNK) break;
-      offset += CHUNK;
+      if (memberCount < CHUNK) break;
+      offset += memberCount;
     }
 
     return result;
@@ -3616,10 +3604,6 @@ export class RedisMessageStore {
       evolutionPreparationSubmissionV1: _stripPreparation,
       dotAsk: _stripDotAsk,
       deliveryBoundary: _stripBoundary,
-      collectiveOwnerAdmissionV1: _stripCollectiveAdmission,
-      collectiveWorkInvocationV1: _stripCollectiveInvocation,
-      collectiveWorkDelegationV1: _stripCollectiveDelegation,
-      collectiveAuthorizationInvalid: _stripCollectiveInvalid,
       ...hostPatch
     } = extra as Record<string, unknown>;
     const merged = { ...current, ...hostPatch };
@@ -4034,6 +4018,13 @@ export class RedisMessageStore {
     return commitRedisLifecycleAppendRecovery(this.redis, this, input, ledgerStore);
   }
 
+  commitLifecycleWakeCoverage(
+    input: LifecycleWakeCoverageInput,
+    ledgerStore: QueueLedgerStore,
+  ): Promise<LifecycleWakeCoverageResult> {
+    return commitRedisLifecycleWakeCoverage(this.redis, this, input, ledgerStore);
+  }
+
   /**
    * F098-D: Atomically mark a queued message delivered while preserving the
    * Clowder AI publication score and returning an applied/no-op receipt.
@@ -4160,12 +4151,19 @@ export class RedisMessageStore {
   /** Hydrate message IDs into full StoredMessage objects */
   private async hydrateMessages(
     ids: string[],
-    options?: { includeDeleted?: boolean; strict?: boolean; humanOnly?: true; evidenceOnly?: true },
+    options?: {
+      includeDeleted?: boolean;
+      strict?: boolean;
+      humanOnly?: true;
+      evidenceOnly?: true;
+      artifactOnly?: true;
+    },
   ): Promise<StoredMessage[]> {
     const pipeline = this.redis.multi();
     for (const id of ids) {
       if (options?.humanOnly) pipeline.eval(HUMAN_SOURCE_HASH_LUA, 1, MessageKeys.detail(id));
       else if (options?.evidenceOnly) pipeline.hmget(MessageKeys.detail(id), ...MESSAGE_EVIDENCE_FIELDS);
+      else if (options?.artifactOnly) pipeline.hmget(MessageKeys.detail(id), ...MESSAGE_ARTIFACT_FIELDS);
       else pipeline.hgetall(MessageKeys.detail(id));
     }
     let span: MessageReadSpan | undefined;
@@ -4192,16 +4190,26 @@ export class RedisMessageStore {
       if (options?.strict && results.length !== ids.length) throw new Error('Owner uncertainty hydration incomplete');
       const messages: StoredMessage[] = [];
       for (const [err, data] of results) {
-        if (err || !data || typeof data !== 'object' || (options?.strict && Array.isArray(data))) {
+        if (
+          err ||
+          !data ||
+          typeof data !== 'object' ||
+          (options?.strict && !options.artifactOnly && Array.isArray(data))
+        ) {
           if (options?.strict) throw new Error('Owner uncertainty hydration failed');
           continue;
         }
-        const d = options?.humanOnly
-          ? humanSourceHash(data)
-          : options?.evidenceOnly
-            ? evidenceMessageHash(data)
-            : (data as Record<string, string>);
-        if (!d) continue;
+        const d = options?.artifactOnly
+          ? artifactMessageHash(data)
+          : options?.humanOnly
+            ? humanSourceHash(data)
+            : options?.evidenceOnly
+              ? evidenceMessageHash(data)
+              : (data as Record<string, string>);
+        if (!d) {
+          if (options?.artifactOnly) throw new Error('Artifact source hydration failed');
+          continue;
+        }
         if (!d.id) continue;
 
         const message = this.hydrateHash(d, span);

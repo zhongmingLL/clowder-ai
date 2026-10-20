@@ -304,7 +304,6 @@ async function createManagedWindow(
   if (appAssist)
     for (const [event, listener] of Object.entries(appAssistPowerListeners)) powerMonitor.on(event, listener);
   win.on('hide', () => {
-    void pauseAppAssist('hidden');
     preferences.suspend('hidden');
     petWindow.dismiss();
     // Electron can emit hide during a macOS Space handoff while the pet is
@@ -320,7 +319,7 @@ async function createManagedWindow(
     clearHideConfirmation();
     hideConfirmation = setTimeout(() => {
       hideConfirmation = undefined;
-      if (!win.isDestroyed()) controller.suspend('hidden');
+      if (!win.isDestroyed()) revokeMedia('hidden');
     }, 1000);
     hideConfirmation.unref?.();
   });

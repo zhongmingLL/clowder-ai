@@ -16,6 +16,7 @@ import { fakeL0Compiler } from './helpers/fake-l0-compiler.js';
 const {
   CodexAgentService: ProductionCodexAgentService,
   buildCodexReasoningArgs,
+  codexConfigObjectFromArgs,
   isGitRepositoryPath,
   resolveCodexApiKeyIsolationRoot,
 } = await import('../dist/domains/cats/services/agents/providers/CodexAgentService.js');
@@ -1837,6 +1838,58 @@ describe('CodexAgentService Tests (CLI mode)', { concurrency: false }, () => {
           assert.ok(
             !args.some((arg) => arg.includes('SECRET_TOKEN') || arg.includes('super-secret-token')),
             'external MCP env names and values must not be exposed in argv',
+          );
+        }),
+      );
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  test('Codex MCP plugin-shaped IDs with dots retain one literal server namespace', async () => {
+    const projectDir = makeTempDir('.tmp-codex-dotted-plugin-');
+    const proc = createMockProcess();
+    const spawnFn = createMockSpawnFn(proc);
+    const service = new CodexAgentService({ l0CompilerFn: fakeL0Compiler, spawnFn, model: 'gpt-5.3-codex' });
+    try {
+      writeMcpDistStubs(projectDir);
+      // Activation/admission is tested by the installed-plugin suites. This
+      // registry entry isolates the provider's handling of the same ID shape.
+      writeCapabilitiesConfig(projectDir, [
+        {
+          id: 'plugin:dev.clowder.xiangqi:xiangqi-analysis',
+          type: 'mcp',
+          globalEnabled: true,
+          source: 'external',
+          mcpServer: { command: 'node', args: ['/fixture/xiangqi.mjs'] },
+        },
+      ]);
+      await withWorkspaceEnv({ CAT_CAFE_WORKSPACE_ROOT: projectDir }, () =>
+        withRuntimeRootEnv(projectDir, async () => {
+          const pending = collect(
+            service.invoke('hello plugin', {
+              workingDirectory: projectDir,
+              callbackEnv: {
+                CAT_CAFE_API_URL: 'http://127.0.0.1:3004',
+                CAT_CAFE_INVOCATION_ID: 'inv-plugin',
+                CAT_CAFE_CALLBACK_TOKEN: 'tok-plugin',
+                CAT_CAFE_CAT_ID: 'codex',
+              },
+            }),
+          );
+          emitCodexEvents(proc, [{ type: 'thread.started', thread_id: 't-plugin' }]);
+          const messages = await pending;
+          assert.equal(spawnFn.mock.callCount(), 1, JSON.stringify(messages));
+          const args = spawnFn.mock.calls[0].arguments[1];
+          const servers = codexConfigObjectFromArgs(args).mcp_servers;
+          const server = servers['plugin__dev.clowder.xiangqi__xiangqi-analysis'];
+          assert.equal(server.enabled, true);
+          assert.equal(server.command, 'node');
+          assert.deepEqual(server.args, ['/fixture/xiangqi.mjs']);
+          assert.equal(
+            args.some((arg) => arg.startsWith('mcp_servers."')),
+            false,
+            'literal server keys must be carried in a root value; Codex splits quoted dotted override keys',
           );
         }),
       );
@@ -3921,6 +3974,32 @@ describe('CodexAgentService Tests (CLI mode)', { concurrency: false }, () => {
     assert.ok(
       proc.stdinData.includes('缅因猫'),
       `systemPrompt should be preserved in stdin prompt when images present, got: ${proc.stdinData.slice(0, 120)}`,
+    );
+  });
+
+  test('Host-verified HMR image path reaches the local CLI without a public upload URL', async () => {
+    const proc = createMockProcess();
+    const spawnFn = createMockSpawnFn(proc);
+    const service = new CodexAgentService({ l0CompilerFn: fakeL0Compiler, spawnFn });
+    const hmrId = `hmr_${'x'.repeat(32)}`;
+    const seen = [];
+    const promise = collect(
+      service.invoke('describe private image', {
+        contentBlocks: [{ type: 'image', url: `hmr:${hmrId}` }],
+        resolveTrustedImagePath: async (id) => {
+          seen.push(id);
+          return '/private/media/verified-image';
+        },
+      }),
+    );
+    emitCodexEvents(proc, [{ type: 'thread.started', thread_id: 'hmr-image-thread' }]);
+    await promise;
+    assert.deepEqual(seen, [hmrId]);
+    const args = spawnFn.mock.calls[0].arguments[1];
+    assert.equal(args[args.indexOf('--image') + 1], '/private/media/verified-image');
+    assert.equal(
+      args.some((arg) => String(arg).includes('/uploads/')),
+      false,
     );
   });
 

@@ -66,16 +66,8 @@ describe('F310 same-source Workspace return', () => {
       producerId: 'F128',
       proposalId: 'proposal/one',
     });
-    expect(resolveEntrustedWorkActionTarget('/api/meeting-intakes/intake%2Fone/confirm')).toEqual({
-      kind: 'approval',
-      producerId: 'F292',
-      proposalId: 'intake/one',
-    });
-    expect(resolveEntrustedWorkActionTarget('/api/meeting-intakes/intake-1/retry')).toEqual({
-      kind: 'approval',
-      producerId: 'F292',
-      proposalId: 'intake-1',
-    });
+    expect(resolveEntrustedWorkActionTarget('/api/meeting-intakes/intake%2Fone/confirm')).toBeNull();
+    expect(resolveEntrustedWorkActionTarget('/api/meeting-intakes/intake-1/retry')).toBeNull();
     expect(resolveEntrustedWorkActionTarget('/api/tasks/task-1')).toBeNull();
     expect(
       resolveEntrustedWorkActionTarget(
@@ -100,6 +92,26 @@ describe('F310 same-source Workspace return', () => {
     expect(
       resolveEntrustedWorkActionTarget(
         '/collective?connectionId=con_aaaaaaaa&workId=work_aaaaaaaa&workRevision=4&channelId=general&resultEventId=evt_result0000&resultRevision=2&taskId=private',
+      ),
+    ).toBeNull();
+    expect(
+      resolveEntrustedWorkActionTarget(
+        '/collective?target=accountability&connectionId=con_aaaaaaaa&workId=work_aaaaaaaa&workRevision=4&channelId=general&roadmapId=roadmap_aaaaaaaa&accountabilityRequestId=accountability_aaaaaaaa',
+      ),
+    ).toEqual({
+      kind: 'collective-accountability',
+      connectionId: 'con_aaaaaaaa',
+      workId: 'work_aaaaaaaa',
+      workRevision: 4,
+      channelId: 'general',
+      roadmapId: 'roadmap_aaaaaaaa',
+      accountabilityRequestId: 'accountability_aaaaaaaa',
+      actionRef:
+        '/collective?target=accountability&connectionId=con_aaaaaaaa&workId=work_aaaaaaaa&workRevision=4&channelId=general&roadmapId=roadmap_aaaaaaaa&accountabilityRequestId=accountability_aaaaaaaa',
+    });
+    expect(
+      resolveEntrustedWorkActionTarget(
+        '/collective?target=accountability&connectionId=con_aaaaaaaa&workId=work_aaaaaaaa&workRevision=4&channelId=general&roadmapId=roadmap_aaaaaaaa&accountabilityRequestId=accountability_aaaaaaaa&resultEventId=evt_result0000',
       ),
     ).toBeNull();
   });

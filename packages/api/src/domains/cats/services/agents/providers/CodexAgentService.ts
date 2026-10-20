@@ -6,7 +6,17 @@ import { assertCodexManagedPlatformSupport } from '../../../../../config/codex-m
 import { assertCodexSharedStateRoots } from '../../../../../config/codex-shared-state.js';
 import { inspectCodexImportSession, listCodexImportSessions } from './CodexLocalSessionSource.js';
 import { bindCodexAccountConfiguration } from './codex-app-server-account-configuration.js';
+import {
+  codexConfigObjectFromArgs,
+  codexMcpConfigArgs,
+  isCodexConfigObject,
+  mergeCodexConfig,
+} from './codex-config-overrides.js';
 import { CODEX_DESKTOP_ISOLATION_ARGS, CODEX_RESTRICTED_APPS_ARGS } from './codex-desktop-isolation.js';
+
+export { codexConfigObjectFromArgs } from './codex-config-overrides.js';
+
+import { buildCodexModelCatalogArgs, isCodexCustomCatalogModel } from './codex-model-catalog.js';
 import { extractUserEnvTemplates, hasSupportedEnvTemplate, resolveEnvMap } from './env-map.js';
 /**
  * Codex Agent Service
@@ -39,7 +49,6 @@ import {
   resolveCodexSpeed,
   resolveCodexSpeedWire,
 } from '@cat-cafe/shared';
-import { parse as parseToml } from 'smol-toml';
 import {
   resolveBinaryRoot,
   resolvePencilCommand,
@@ -62,6 +71,7 @@ import {
   resolveMcpCommand as resolveCodexMcpCommand,
   resolveMcpWorkingDir as resolveCodexMcpWorkingDir,
 } from '../../../../../config/capabilities/mcp-launch-paths.js';
+import { pluginMcpEnvironment } from '../../../../../config/capabilities/plugin-mcp-environment.js';
 import { deriveAutoCompactTokenLimit, getCatEffort } from '../../../../../config/cat-config-loader.js';
 import { getCatModel } from '../../../../../config/cat-models.js';
 import {
@@ -120,7 +130,6 @@ import type {
   ToolExecutionPolicy,
 } from '../../types.js';
 import { appendProviderSubexecutionEvent } from '../../types.js';
-import { COLLECTIVE_WORK_TOOL_NAMES } from '../invocation/tool-execution-policy.js';
 import type { AuditLogSink, RawArchiveSink } from '../providers/codex-audit-hooks.js';
 import { extractCommandExecutionLifecycle, sanitizeRawEvent } from '../providers/codex-audit-hooks.js';
 import {
@@ -135,7 +144,7 @@ import {
   type CodexSessionContextSnapshotResolver,
   createCodexSessionContextSnapshotResolver,
 } from '../providers/codex-session-context-snapshot.js';
-import { extractImagePaths } from '../providers/image-paths.js';
+import { extractTrustedImagePaths } from '../providers/image-paths.js';
 import { collectCodexCapabilitySource } from './CodexAppServerCapabilitySource.js';
 import type {
   CodexAppServerLifecycleEvent,
@@ -182,6 +191,7 @@ import {
 import { buildCodexCapacityRecoveryCardMessage } from './codex-capacity-recovery-card.js';
 import { CodexErrorEvidence } from './codex-error-evidence.js';
 import { CODEX_LIVE_POLICY_ARGS } from './codex-live-policy.js';
+import { type PreparedCodexNativeLaunch, prepareCodexNativeLaunch } from './codex-plugin-native-launch.js';
 import {
   buildCodexServedModelMismatchEvent,
   codexHostServedModels,
@@ -189,14 +199,6 @@ import {
   mergeRustLogDirective,
   snapshotFromHostEntry,
 } from './codex-served-model.js';
-import { COLLECTIVE_CODEX_POLICY_ARGS, COLLECTIVE_MCP_ENV_KEYS } from './collective-cli-policy.js';
-import { prepareCollectiveCodexHome } from './collective-codex-home.js';
-import {
-  buildCollectiveWorkAuthorityGuardArgs,
-  buildCollectiveWorkCodexPolicyArgs,
-  buildCollectiveWorkMcpEnv,
-  privateWorkControlRoot,
-} from './collective-work-cli-policy.js';
 import { createDirectAgentCarrierSession } from './DirectAgentCarrierSession.js';
 import { compileL0ViaSubprocess } from './l0-compiler.js';
 import {
@@ -595,14 +597,16 @@ export function buildCodexReasoningArgs(effortLevel: string): string[] {
 /**
  * `--config` keys whose values are part of a system-owned runtime contract.
  * Free-form cliConfigArgs may override ordinary Codex preferences, but they
- * cannot replace identity/speed controls or the model/window that an
- * invocation_config binding certifies as applied before launch.
+ * cannot replace identity/speed controls, the model/window an
+ * invocation_config binding certifies as applied before launch, or the
+ * custom-model metadata catalog injected for routed models.
  */
 const RESERVED_SYSTEM_CONFIG_KEYS: ReadonlySet<string> = new Set([
   'developer_instructions',
   'service_tier',
   'model',
   'model_context_window',
+  'model_catalog_json',
   'model_auto_compact_token_limit',
 ]);
 
@@ -801,7 +805,6 @@ function writeCodexMcpEnvWrapper(spec: {
 async function buildCatCafeMcpArgs(
   callbackEnv?: Record<string, string>,
   workingDirectory?: string,
-  scopedWork = false,
 ): Promise<{ args: string[]; bearerEnv: Record<string, string>; declaredServerNames?: readonly string[] }> {
   if (!callbackEnv) return { args: [], bearerEnv: {} };
 
@@ -832,41 +835,8 @@ async function buildCatCafeMcpArgs(
     }
   }
   if (!mcpDistDir) {
-    if (callbackEnv.CAT_CAFE_MCP_PROFILE === 'collective-participation' || scopedWork)
-      throw new Error('Collective MCP runtime is not built');
     return { args: [], bearerEnv: {} };
   }
-  if (callbackEnv.CAT_CAFE_MCP_PROFILE === 'collective-participation' || scopedWork) {
-    const entrypoint = resolve(mcpDistDir, CAT_CAFE_SPLIT_ENTRYPOINTS.get('cat-cafe-collab')!);
-    if (!existsSync(entrypoint)) throw new Error('Collective collab entrypoint is unavailable');
-    return {
-      bearerEnv: {},
-      declaredServerNames: ['cat-cafe-collab'],
-      args: [
-        '--config',
-        `mcp_servers.cat-cafe-collab.command=${toTomlString(resolveCatCafeNodeCommand())}`,
-        '--config',
-        `mcp_servers.cat-cafe-collab.args=[${toTomlString(entrypoint)}]`,
-        '--config',
-        `mcp_servers.cat-cafe-collab.env_vars=[${COLLECTIVE_MCP_ENV_KEYS.map(toTomlString).join(',')}]`,
-        '--config',
-        'mcp_servers.cat-cafe-collab.enabled=true',
-        '--config',
-        'mcp_servers.cat-cafe-collab.required=true',
-        '--config',
-        'mcp_servers.cat-cafe-collab.default_tools_approval_mode="approve"',
-        ...(scopedWork
-          ? [
-              '--config',
-              'mcp_servers.cat-cafe-collab.env={CAT_CAFE_MCP_PROFILE="collective-work"}',
-              '--config',
-              `mcp_servers.cat-cafe-collab.enabled_tools=${JSON.stringify(COLLECTIVE_WORK_TOOL_NAMES.filter((name) => !['cat_cafe_thread_context', 'cat_cafe_native_turn_admission', 'cat_cafe_refresh_token'].includes(name)))}`,
-            ]
-          : []),
-      ],
-    };
-  }
-
   const binaryProjectRoot = resolve(mcpDistDir, '../../..');
   const capabilitiesProjectRoot = await resolveInvokeCapabilityRoot(binaryProjectRoot);
   const catId = callbackEnv.CAT_CAFE_CAT_ID;
@@ -935,7 +905,7 @@ async function buildCatCafeMcpArgs(
         // `cat-cafe` shim above (L371-379).
         if (!s.enabled) {
           disabledServers.push(s.name);
-          const dummyToml = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : `"${s.name}"`;
+          const dummyToml = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : toTomlString(s.name);
           if (s.transport === 'streamableHttp' && s.url) {
             // URL-based disabled: emit url + enabled=false to avoid transport
             // conflict with stale config.toml URL entries — overlaying stdio
@@ -963,7 +933,7 @@ async function buildCatCafeMcpArgs(
         // (same pattern as ClaudeAgentService). The resolver scans the local
         // machine for the latest Pencil MCP binary and returns {command, args}.
         if (s.resolver === 'pencil') {
-          const tomlName = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : `"${s.name}"`;
+          const tomlName = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : toTomlString(s.name);
           const pencil = await resolvePencilCommand({ projectRoot: configSourceRoot });
           if (pencil) {
             enabledServers.push(s.name);
@@ -998,7 +968,7 @@ async function buildCatCafeMcpArgs(
         // the token into an env var and point `bearer_token_env_var` at it.
         if (s.transport === 'streamableHttp' && s.url) {
           enabledServers.push(s.name);
-          const tomlName = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : `"${s.name}"`;
+          const tomlName = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : toTomlString(s.name);
           args.push(
             '--config',
             `mcp_servers.${tomlName}.url=${toTomlString(s.url)}`,
@@ -1045,7 +1015,7 @@ async function buildCatCafeMcpArgs(
         } else if (s.command) {
           cmd = resolveCodexMcpCommand(s.command, workingDir, configSourceRoot);
           cmdArgs = resolveCodexMcpArgs(s.args, workingDir, configSourceRoot);
-          if (s.env && Object.keys(s.env).length > 0) envEntries = s.env;
+          envEntries = pluginMcpEnvironment(s, callbackEnv);
         }
         if (!cmd) continue;
         if (envEntries) {
@@ -1060,7 +1030,7 @@ async function buildCatCafeMcpArgs(
         }
         enabledServers.push(s.name);
 
-        const tomlName = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : `"${s.name}"`;
+        const tomlName = /^[A-Za-z0-9_-]+$/.test(s.name) ? s.name : toTomlString(s.name);
         args.push(
           '--config',
           `mcp_servers.${tomlName}.command=${toTomlString(cmd)}`,
@@ -1125,7 +1095,7 @@ async function buildCatCafeMcpArgs(
     },
     '#712: MCP invoke-time injection',
   );
-  return { args, bearerEnv, declaredServerNames: [...new Set(enabledServers)].sort() };
+  return { args: codexMcpConfigArgs(args), bearerEnv, declaredServerNames: [...new Set(enabledServers)].sort() };
 }
 
 export function isGitRepositoryPath(workingDirectory: string): boolean {
@@ -1175,38 +1145,6 @@ export function buildCodexAppServerArgs(args: readonly string[]): string[] {
     }
   }
   return out;
-}
-
-/** Convert Codex CLI `--config key=<toml>` pairs into app-server thread config. */
-export function codexConfigObjectFromArgs(args: readonly string[]): Record<string, unknown> {
-  let config: Record<string, unknown> = {};
-  for (let index = 0; index < args.length; index++) {
-    const flag = args[index];
-    if (flag !== '--config' && flag !== '-c') continue;
-    const assignment = args[index + 1];
-    if (assignment !== undefined) {
-      const overlay = parseToml(assignment) as Record<string, unknown>;
-      config = mergeCodexConfig(config, overlay);
-      index++;
-    }
-  }
-  return config;
-}
-
-function mergeCodexConfig(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
-  const merged = { ...base };
-  for (const [key, value] of Object.entries(overlay)) {
-    const previous = merged[key];
-    merged[key] =
-      isCodexConfigObject(previous) && isCodexConfigObject(value) ? mergeCodexConfig(previous, value) : value;
-  }
-  return merged;
-}
-
-function isCodexConfigObject(value: unknown): value is Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
 }
 
 function readInitializedProviderVersion(value: unknown): string {
@@ -1270,8 +1208,6 @@ export class CodexAgentService implements AgentService {
   }
 
   supportsToolExecutionPolicy(policy: ToolExecutionPolicy): boolean {
-    if (policy.mode === 'collective_participation') return true;
-    if (policy.mode === 'collective_work') return process.platform === 'darwin' || process.platform === 'linux';
     // exec_json has the proven --ignore-user-config + empty MCP hard fence.
     // app-server 0.144.4 exposes no equivalent ignore-user-config flag, so a
     // read-only supplement must fail before model launch instead of trusting
@@ -1638,7 +1574,7 @@ export class CodexAgentService implements AgentService {
   private async compileDeveloperInstructions(
     cliModel: string,
     userId?: string,
-    projection: 'owner' | 'public' | 'collective-work' = 'owner',
+    projection: 'owner' | 'public' = 'owner',
   ): Promise<{ value: string } | { error: string; metadata: MessageMetadata }> {
     try {
       const compiledL0 = await this.l0CompilerFn({ catId: this.catId as string, userId, projection });
@@ -1677,60 +1613,33 @@ export class CodexAgentService implements AgentService {
     promptSource: CodexAppServerPromptSource,
     options?: AgentServiceOptions,
   ): AsyncIterable<AgentMessage> {
-    // The preflight seam exists only on app_server. Fail closed instead of
-    // quietly falling back to a prompt frozen before the provider verdict.
-    const participation = options?.toolExecutionPolicy?.mode === 'collective_participation';
-    const privateWork =
-      options?.toolExecutionPolicy?.mode === 'collective_work' ? options.toolExecutionPolicy : undefined;
-    const scopedNative = participation || Boolean(privateWork);
-    const requiredTools = normalizeRequiredTools(options?.requiredTools);
-    const carrierMode = scopedNative
-      ? 'exec_json'
-      : options?.requireExactResume || options?.liveCompanion || requiredTools.length > 0
-        ? 'app_server'
-        : this.carrierMode;
-    if (scopedNative && requiredTools.length > 0) {
-      const metadata: MessageMetadata = {
-        provider: 'openai',
-        model: options?.callbackEnv?.CAT_CAFE_OPENAI_MODEL_OVERRIDE ?? this.model,
-        requiredToolsUnavailable: {
-          code: REQUIRED_TOOLS_UNAVAILABLE,
-          missingTools: requiredTools,
-        },
-      };
-      const error = new CodexRequiredToolsUnavailableError(requiredTools);
-      yield {
-        type: 'error',
-        catId: this.catId,
-        error: error.message,
-        errorCode: REQUIRED_TOOLS_UNAVAILABLE,
-        metadata,
-        timestamp: Date.now(),
-      };
-      yield {
-        type: 'done',
-        catId: this.catId,
-        errorCode: REQUIRED_TOOLS_UNAVAILABLE,
-        metadata,
-        timestamp: Date.now(),
-      };
+    if (!options || (!options.pluginNativeLaunch && options.toolExecutionPolicy?.mode !== 'plugin_native')) {
+      yield* this.invokePrepared(promptSource, options);
       return;
     }
-    if (
-      participation &&
-      (!options?.systemPrompt ||
-        options.sessionId ||
-        !options.workingDirectory ||
-        options.callbackEnv?.CAT_CAFE_MCP_PROFILE !== 'collective-participation')
-    )
-      throw new Error('Invalid public participation launch');
-    if (
-      privateWork &&
-      (options?.sessionId ||
-        options?.workingDirectory !== privateWork.workspaceRoot ||
-        !options?.callbackEnv?.CAT_CAFE_CALLBACK_TOKEN)
-    )
-      throw new Error('Invalid scoped private Work launch');
+    const native = await prepareCodexNativeLaunch(options, this.carrierMode, promptSource.kind === 'frozen');
+    try {
+      for await (const message of this.invokePrepared(promptSource, native.options, native)) {
+        await native.assertCurrent();
+        yield message;
+      }
+    } finally {
+      native.dispose();
+    }
+  }
+
+  private async *invokePrepared(
+    promptSource: CodexAppServerPromptSource,
+    options?: AgentServiceOptions,
+    native?: PreparedCodexNativeLaunch,
+  ): AsyncIterable<AgentMessage> {
+    // The preflight seam exists only on app_server. Fail closed instead of
+    // quietly falling back to a prompt frozen before the provider verdict.
+    const requiredTools = normalizeRequiredTools(options?.requiredTools);
+    const carrierMode =
+      options?.requireExactResume || options?.liveCompanion || requiredTools.length > 0
+        ? 'app_server'
+        : this.carrierMode;
     if (promptSource.kind === 'preflight' && carrierMode !== 'app_server') {
       throw new Error('codex_continuity_preflight_requires_app_server');
     }
@@ -1753,11 +1662,15 @@ export class CodexAgentService implements AgentService {
     /** exec_json can only carry frozen bytes; undefined means "preflight, app_server only". */
     const execStdinInput = effectivePromptSource.kind === 'frozen' ? effectivePromptSource.prompt : undefined;
     const effectiveModel = options?.callbackEnv?.CAT_CAFE_OPENAI_MODEL_OVERRIDE ?? this.model;
-    const imagePaths = scopedNative ? [] : extractImagePaths(options?.contentBlocks, options?.uploadDir);
+    const imagePaths = await extractTrustedImagePaths(
+      options?.contentBlocks,
+      options?.uploadDir,
+      options?.resolveTrustedImagePath,
+    );
     const imageArgs = imagePaths.flatMap((path) => ['--image', path]);
 
-    const sandboxMode = readOnly || scopedNative || live ? 'read-only' : getCodexSandboxMode();
-    const approvalPolicy = readOnly || scopedNative || live ? 'never' : getCodexApprovalPolicy();
+    const sandboxMode = readOnly || live || native ? 'read-only' : getCodexSandboxMode();
+    const approvalPolicy = readOnly || live || native ? 'never' : getCodexApprovalPolicy();
     const inheritedEffort = getCatEffort(this.catId as string, undefined, 'openai', effectiveModel);
     const effortLevel = resolveCliEffortOverride(
       'openai',
@@ -1792,6 +1705,13 @@ export class CodexAgentService implements AgentService {
             `model_auto_compact_token_limit=${deriveAutoCompactTokenLimit(contextWindow)}`,
           ]
         : [];
+    // Custom-model metadata: a model without a built-in Codex catalog entry
+    // (e.g. deepseek-flash) gets our catalog file so the CLI stops falling
+    // back to generic metadata. Gated per-model because the flag replaces
+    // the entire built-in catalog.
+    const modelCatalogArgs = buildCodexModelCatalogArgs(effectiveModel, carrierMode);
+    const catalogRequested = carrierMode === 'exec_json' && isCodexCustomCatalogModel(effectiveModel);
+    const catalogApplied = modelCatalogArgs.length > 0;
     // #712: Inject ALL enabled MCP servers from capabilities.json at invoke time.
     const appServerHostPool = this.appServerHostPool;
     const wantsPooledAppServer =
@@ -1815,32 +1735,32 @@ export class CodexAgentService implements AgentService {
       wantsPooledAppServer && (!callbackHasInvocationCredentials || pooledCredentialEnv !== null);
     const mcpCallbackEnv = usePooledAppServer
       ? withoutFrozenInvocationCredentials(pooledCredentialEnv?.env ?? options?.callbackEnv)
-      : privateWork
-        ? buildCollectiveWorkMcpEnv(options?.callbackEnv ?? {})
-        : options?.callbackEnv;
+      : options?.callbackEnv;
     const {
       args: catCafeMcpArgs,
       bearerEnv: mcpBearerEnv,
       declaredServerNames: declaredMcpServerNames,
-    } = readOnly
-      ? { args: [], bearerEnv: {}, declaredServerNames: [] as readonly string[] }
-      : liveConfig
-        ? {
-            args: [],
-            bearerEnv: {},
-            declaredServerNames: Object.keys(isCodexConfigObject(liveConfig.mcp_servers) ? liveConfig.mcp_servers : {}),
-          }
-        : await buildCatCafeMcpArgs(mcpCallbackEnv, options?.workingDirectory, Boolean(privateWork));
-    const gitRepoArgs = readOnly || scopedNative || live ? [] : buildGitRepoArgs(options?.workingDirectory);
+    } = native
+      ? { args: [], bearerEnv: {}, declaredServerNames: [native.serverName] }
+      : readOnly
+        ? { args: [], bearerEnv: {}, declaredServerNames: [] as readonly string[] }
+        : liveConfig
+          ? {
+              args: [],
+              bearerEnv: {},
+              declaredServerNames: Object.keys(
+                isCodexConfigObject(liveConfig.mcp_servers) ? liveConfig.mcp_servers : {},
+              ),
+            }
+          : await buildCatCafeMcpArgs(mcpCallbackEnv, options?.workingDirectory);
+    const gitRepoArgs = readOnly || live || native ? [] : buildGitRepoArgs(options?.workingDirectory);
     // User-defined CLI args from the member editor (#567) — passed as-is, no implicit wrapping.
     // Each entry is split by whitespace (e.g. "--config model_reasoning_effort=\"low\"").
     // F203 Phase C / 砚砚 P1: strip reserved system config keys (developer_instructions,
     // carries L0) before dedup — otherwise dedup() would skip the system push and the
     // L0 would be silently overridden by any cliConfigArgs entry with the same key.
     const userConfigArgs = stripReservedCodexSystemConfigs(
-      (readOnly || scopedNative || live ? [] : (options?.cliConfigArgs ?? [])).flatMap((arg) =>
-        arg.trim().split(/\s+/),
-      ),
+      (readOnly || live || native ? [] : (options?.cliConfigArgs ?? [])).flatMap((arg) => arg.trim().split(/\s+/)),
       this.catId as string,
     );
     // Collect user config keys across every accepted spelling so ordinary,
@@ -1883,8 +1803,8 @@ export class CodexAgentService implements AgentService {
     const customBaseUrl =
       (options?.callbackEnv?.OPENAI_BASE_URL ??
         options?.callbackEnv?.OPENAI_API_BASE ??
-        (scopedNative ? undefined : options?.accountEnv?.OPENAI_BASE_URL) ??
-        (scopedNative ? undefined : options?.accountEnv?.OPENAI_API_BASE)) ||
+        options?.accountEnv?.OPENAI_BASE_URL ??
+        options?.accountEnv?.OPENAI_API_BASE) ||
       (authMode === 'api_key' ? CODEX_API_DEFAULT_BASE_URL : undefined);
     const customProviderArgs: string[] = customBaseUrl ? buildCodexCustomProviderArgs(customBaseUrl, authMode) : [];
     // Default OAuth sessions to Codex's built-in OpenAI provider so upstream
@@ -1950,9 +1870,10 @@ export class CodexAgentService implements AgentService {
     // fail-closed (generator contract, mirrors the CLI-not-found path below).
     const l0Result = await this.compileDeveloperInstructions(
       cliModel,
-      options?.callbackEnv?.CAT_CAFE_USER_ID,
-      participation ? 'public' : privateWork ? 'collective-work' : 'owner',
+      native ? undefined : options?.callbackEnv?.CAT_CAFE_USER_ID,
+      native ? 'public' : 'owner',
     );
+    if (native) await native.assertCurrent();
     if ('error' in l0Result) {
       yield {
         type: 'error' as const,
@@ -1967,15 +1888,12 @@ export class CodexAgentService implements AgentService {
     let nativeEffectGuardArgs: string[];
     let verifiedNativeShellCommand: string | undefined;
     try {
-      if (this.nativeShellSafetyCheck) {
-        if (scopedNative) throw new Error('native_shell_guard_unsupported_scoped_policy');
+      if (!native && this.nativeShellSafetyCheck) {
         verifiedNativeShellCommand = await verifyReviewedNativeShellCli(this.cliCommand);
       }
-      nativeEffectGuardArgs = participation
+      nativeEffectGuardArgs = native
         ? []
-        : privateWork
-          ? await buildCollectiveWorkAuthorityGuardArgs(privateWorkControlRoot(privateWork))
-          : buildCodexNativeEffectGuardArgs({ nativeShellSafetyCheck: this.nativeShellSafetyCheck });
+        : buildCodexNativeEffectGuardArgs({ nativeShellSafetyCheck: this.nativeShellSafetyCheck });
     } catch (error) {
       const metadata: MessageMetadata = {
         provider: 'openai',
@@ -1998,9 +1916,7 @@ export class CodexAgentService implements AgentService {
     const invocationApprovalSurface: CodexApprovalSurface = hasRuntimeInteractionSurface
       ? 'interactive'
       : this.approvalSurface;
-    const developerInstructions = participation
-      ? `${l0Result.value}\n\n---\n\n${options!.systemPrompt!}`
-      : appendCatCafeGithubWriteRouting(l0Result.value, invocationApprovalSurface);
+    const developerInstructions = appendCatCafeGithubWriteRouting(l0Result.value, invocationApprovalSurface);
     const explicitIdeate = options?.routeIntent?.intent === 'ideate' && options.routeIntent.explicit;
     const collaborationModeKind: 'plan' | 'default' | null = explicitIdeate
       ? 'plan'
@@ -2025,10 +1941,10 @@ export class CodexAgentService implements AgentService {
       );
     }
     const developerInstructionsArgs = ['--config', `developer_instructions=${toTomlString(developerInstructions)}`];
-    const appsWriteApprovalArgs = readOnly || scopedNative || live ? [] : [...CODEX_APPS_WRITE_APPROVAL_ARGS];
+    const appsWriteApprovalArgs = readOnly || live || native ? [] : [...CODEX_APPS_WRITE_APPROVAL_ARGS];
     const desktopIsolationArgs = [
       ...CODEX_DESKTOP_ISOLATION_ARGS,
-      ...(readOnly || scopedNative || live ? CODEX_RESTRICTED_APPS_ARGS : []),
+      ...(readOnly || live || native ? CODEX_RESTRICTED_APPS_ARGS : []),
     ];
 
     // resume 子命令不接受 --sandbox / --add-dir, but it does accept
@@ -2042,13 +1958,9 @@ export class CodexAgentService implements AgentService {
     // /proc/<pid>/cmdline 会把完整对话历史（含跨 thread/猫/用户内容）暴露给任何
     // 并发进程。'--' 结束选项解析，'-' 让 codex 从 stdin 读取 PROMPT。
     const promptArgs = ['--', '-'];
-    const readOnlyArgs = participation
-      ? [...COLLECTIVE_CODEX_POLICY_ARGS]
-      : privateWork
-        ? buildCollectiveWorkCodexPolicyArgs(privateWork)
-        : readOnly
-          ? ['--ignore-user-config', '--config', 'mcp_servers={}', '--config', 'apps._default.enabled=false']
-          : [];
+    const readOnlyArgs = readOnly
+      ? ['--ignore-user-config', '--config', 'mcp_servers={}', '--config', 'apps._default.enabled=false']
+      : [];
 
     // Dedup: skip system --config/--flag pairs that the user explicitly overrides (#567).
     const dedup = (src: string[]): string[] => {
@@ -2079,6 +1991,7 @@ export class CodexAgentService implements AgentService {
           ...dedup(modelArgs),
           ...dedup(reasoningArgs),
           ...dedup(contextWindowArgs),
+          ...dedup(modelCatalogArgs),
           ...dedup(sandboxConfigArgs),
           ...dedup(approvalArgs),
           ...dedup(appsWriteApprovalArgs),
@@ -2091,6 +2004,7 @@ export class CodexAgentService implements AgentService {
           ...gitRepoArgs,
           ...catCafeMcpArgs,
           ...imageArgs,
+          ...(native?.args ?? []),
           ...promptArgs,
         ]
       : [
@@ -2100,8 +2014,9 @@ export class CodexAgentService implements AgentService {
           ...dedup(modelArgs),
           ...dedup(reasoningArgs),
           ...dedup(contextWindowArgs),
-          ...(scopedNative ? [] : ['--sandbox', sandboxMode]),
-          ...(readOnly || scopedNative ? [] : ['--add-dir', '.git']),
+          ...dedup(modelCatalogArgs),
+          ...['--sandbox', sandboxMode],
+          ...(readOnly || native ? [] : ['--add-dir', '.git']),
           ...dedup(approvalArgs),
           ...dedup(appsWriteApprovalArgs),
           ...dedup(developerInstructionsArgs),
@@ -2113,6 +2028,7 @@ export class CodexAgentService implements AgentService {
           ...gitRepoArgs,
           ...catCafeMcpArgs,
           ...imageArgs,
+          ...(native?.args ?? []),
           ...promptArgs,
         ];
     const appServerArgs =
@@ -2123,6 +2039,7 @@ export class CodexAgentService implements AgentService {
             ...dedup(modelArgs),
             ...dedup(reasoningArgs),
             ...dedup(contextWindowArgs),
+            ...dedup(modelCatalogArgs),
             ...dedup(appsWriteApprovalArgs),
             ...dedup(providerArgs),
             ...userConfigArgs,
@@ -2165,7 +2082,7 @@ export class CodexAgentService implements AgentService {
         );
       if (accountLaunch.managed || (accountLaunch.accountRef === 'codex' && accountLaunch.authMode === 'oauth'))
         assertCodexSharedStateRoots(accountLaunch.accountOwnerRoot, { launch: accountLaunch });
-      if (!scopedNative) {
+      if (!native) {
         const managedArgs = codexManagedLaunchArgs(accountLaunch, userConfigArgs);
         const promptSeparator = args.indexOf('--');
         args.splice(promptSeparator < 0 ? args.length : promptSeparator, 0, ...managedArgs);
@@ -2173,16 +2090,16 @@ export class CodexAgentService implements AgentService {
       }
       if (accountLaunch.managed) assertCodexManagedPlatformSupport(accountLaunch.credentialHome, this.cliCommand);
       const apiExecutionHome =
-        !scopedNative && authMode === 'api_key' && customBaseUrl
+        !native && authMode === 'api_key' && customBaseUrl
           ? resolveCodexApiExecutionHome(accountLaunch, customBaseUrl, options?.workingDirectory ?? process.cwd(), {
               ...process.env,
               ...options?.accountEnv,
             })
           : undefined;
       const rawEnv = {
-        ...(privateWork ? buildCollectiveWorkMcpEnv(options?.callbackEnv ?? {}) : (options?.callbackEnv ?? {})),
+        ...(options?.callbackEnv ?? {}),
       };
-      const selectedApiEnv = { ...rawEnv, ...(scopedNative ? {} : options?.accountEnv) };
+      const selectedApiEnv = { ...rawEnv, ...(native ? {} : options?.accountEnv) };
       if (live) {
         delete rawEnv.CAT_CAFE_INVOCATION_ID;
         delete rawEnv.CAT_CAFE_CALLBACK_TOKEN;
@@ -2197,40 +2114,18 @@ export class CodexAgentService implements AgentService {
       }
       // For API Key mode: use temp HOME to prevent OAuth token refresh interference.
       // On Windows, Rust/codex uses USERPROFILE (not HOME) for config directory.
-      if (scopedNative) {
-        Object.assign(
-          rawEnv,
-          await prepareCollectiveCodexHome(
-            privateWork ? privateWorkControlRoot(privateWork) : options!.workingDirectory!,
-            authMode,
-            accountLaunch.credentialHome,
-          ),
-        );
-        if (accountLaunch.managed) {
-          const scopedHome = rawEnv.CODEX_HOME ?? `${rawEnv.HOME}/.codex`;
-          const managedArgs = codexManagedLaunchArgs({ ...accountLaunch, sqliteHome: scopedHome }, []);
-          const promptSeparator = args.indexOf('--');
-          args.splice(promptSeparator < 0 ? args.length : promptSeparator, 0, ...managedArgs);
-          appServerArgs.push(...managedArgs);
-        }
-      } else if (apiExecutionHome) {
+      if (!native && apiExecutionHome) {
         rawEnv.HOME = dirname(apiExecutionHome);
         if (process.platform === 'win32') rawEnv.USERPROFILE = rawEnv.HOME;
-      } else if (!accountLaunch.managed && authMode === 'api_key' && customBaseUrl) {
+      } else if (!native && !accountLaunch.managed && authMode === 'api_key' && customBaseUrl) {
         const isolatedHome = this.getApiKeyIsolationHome();
         rawEnv.HOME = isolatedHome;
         if (process.platform === 'win32') {
           rawEnv.USERPROFILE = isolatedHome;
         }
       }
-      const homeIsolated = scopedNative || (authMode === 'api_key' && !!customBaseUrl);
-      const codexEnv = privateWork
-        ? {
-            ...Object.fromEntries(Object.keys(process.env).map((key) => [key, null])),
-            PATH: process.env.PATH ?? '/usr/bin:/bin',
-            ...applyAuthMode(rawEnv, authMode),
-          }
-        : withVerdictGhGuardEnv(applyAuthMode(rawEnv, authMode));
+      const homeIsolated = !!native || (authMode === 'api_key' && !!customBaseUrl);
+      const codexEnv = native ? { ...native.env } : withVerdictGhGuardEnv(applyAuthMode(rawEnv, authMode));
 
       // Diagnostic logging: critical env state for debugging CLI startup failures
       log.info(
@@ -2238,7 +2133,7 @@ export class CodexAgentService implements AgentService {
           catId: this.catId,
           authMode,
           homeIsolated,
-          isolatedHome: homeIsolated ? rawEnv.HOME : undefined,
+          isolatedHome: native?.env.HOME ?? (homeIsolated ? rawEnv.HOME : undefined),
           customBaseUrl: customBaseUrl ? redactUrlForLog(customBaseUrl) : null,
           sandboxMode,
           hasOpenaiKey: !!codexEnv.OPENAI_API_KEY,
@@ -2257,7 +2152,7 @@ export class CodexAgentService implements AgentService {
       // F171: Account env vars applied LAST — user overrides provider-injected values.
       // Strip OPENAI_BASE_URL/OPENAI_API_BASE if already consumed via --config model_providers
       // to prevent the deprecated env var from conflicting with the CLI config.
-      if (options?.accountEnv && !scopedNative) {
+      if (!native && options?.accountEnv) {
         for (const [k, v] of Object.entries(options.accountEnv)) {
           if (customBaseUrl && (k === 'OPENAI_BASE_URL' || k === 'OPENAI_API_BASE')) continue;
           codexEnv[k] = v;
@@ -2282,30 +2177,33 @@ export class CodexAgentService implements AgentService {
         codexEnv.HOME = dirname(apiExecutionHome);
         if (process.platform === 'win32') codexEnv.USERPROFILE = codexEnv.HOME;
       }
-      const finalAccountEnv = finalizeCodexAccountEnvironment(accountLaunch, {
-        env: codexEnv,
-        selectedApiEnv,
-        memberConfigArgs: userConfigArgs,
-        args: carrierMode === 'app_server' ? appServerArgs : args,
-        ...(carrierMode === 'app_server' && appServerThreadConfig ? { rpcConfig: appServerThreadConfig } : {}),
-        cwd: options?.workingDirectory ?? process.cwd(),
-        ...(homeIsolated ? { executionHome: apiExecutionHome ?? rawEnv.CODEX_HOME ?? `${rawEnv.HOME}/.codex` } : {}),
-      });
+      const finalAccountEnv = native
+        ? { ...codexEnv }
+        : finalizeCodexAccountEnvironment(accountLaunch, {
+            env: codexEnv,
+            selectedApiEnv,
+            memberConfigArgs: userConfigArgs,
+            args: carrierMode === 'app_server' ? appServerArgs : args,
+            ...(carrierMode === 'app_server' && appServerThreadConfig ? { rpcConfig: appServerThreadConfig } : {}),
+            cwd: options?.workingDirectory ?? process.cwd(),
+            ...(homeIsolated
+              ? { executionHome: apiExecutionHome ?? rawEnv.CODEX_HOME ?? `${rawEnv.HOME}/.codex` }
+              : {}),
+          });
       Object.assign(codexEnv, finalAccountEnv);
-      if (authMode === 'api_key') {
+      if (!native && authMode === 'api_key') {
+        if (!finalAccountEnv.CODEX_HOME) throw new Error('Codex account home is unavailable');
         mkdirSync(finalAccountEnv.CODEX_HOME, { recursive: true, mode: 0o700 });
       }
 
       const semanticCompletionController = new AbortController();
 
-      // Public policy is supported by the native Codex CLI, not arbitrary member command wrappers.
-      const effectiveCommand = scopedNative ? 'codex' : this.cliCommand;
-      const codexCommand = verifiedNativeShellCommand ?? resolveCliCommand(effectiveCommand);
+      const codexCommand = verifiedNativeShellCommand ?? resolveCliCommand(this.cliCommand);
       if (!codexCommand) {
         yield {
           type: 'error' as const,
           catId: this.catId,
-          error: formatCliNotFoundError(effectiveCommand),
+          error: formatCliNotFoundError(this.cliCommand),
           metadata,
           timestamp: Date.now(),
         };
@@ -2326,6 +2224,10 @@ export class CodexAgentService implements AgentService {
           cwd: options?.workingDirectory ?? null,
           authMode,
           argCount: args.length,
+          // Distinguish "builtin model / app_server (not applicable)" from
+          // "custom model requested the catalog but materialization fell back".
+          modelCatalog: catalogApplied ? 'applied' : catalogRequested ? 'fallback' : 'not_applicable',
+          requestedContextWindow: contextWindow ?? null,
           // Log flag names + --config keys (no values) for debugging
           cliFlags: args.filter((a) => a.startsWith('-')),
           cliConfigKeys: args.map((a, i) => (args[i - 1] === '--config' ? a.split('=')[0] : null)).filter(Boolean),
@@ -2342,6 +2244,7 @@ export class CodexAgentService implements AgentService {
         // invocation can never reach a CLI spawn with empty or premature bytes.
         ...(options?.workingDirectory ? { cwd: options.workingDirectory } : {}),
         env: codexEnv,
+        ...(native ? { inheritParentEnv: false } : {}),
         ...(options?.signal ? { signal: options.signal } : {}),
         ...(options?.invocationId ? { invocationId: options.invocationId } : {}),
         ...(options?.cliSessionId ? { cliSessionId: options.cliSessionId } : {}),
@@ -2363,14 +2266,13 @@ export class CodexAgentService implements AgentService {
         ...(servedModelTracker ? { onStderrLine: servedModelTracker.onStderrLine } : {}),
       };
       const useAppServer = carrierMode === 'app_server';
-      const schemaDeliveryProfile = participation
-        ? ('collective-participation' as const)
-        : readOnly
-          ? ('readonly' as const)
-          : live
-            ? ('desktop' as const)
-            : ('full' as const);
-      const schemaDeliveryProfileId = live ? 'desktop:live-companion' : schemaDeliveryProfile;
+      const schemaDeliveryProfile =
+        readOnly || native ? ('readonly' as const) : live ? ('desktop' as const) : ('full' as const);
+      const schemaDeliveryProfileId = native
+        ? `plugin-native:${native.kind}`
+        : live
+          ? 'desktop:live-companion'
+          : schemaDeliveryProfile;
       const schemaDelivery = await resolveMcpSchemaDeliveryForProviderLaunch({
         repoRoot: findMonorepoRoot(dirname(fileURLToPath(import.meta.url))),
         command: codexCommand,
@@ -2413,7 +2315,6 @@ export class CodexAgentService implements AgentService {
             ...(requestedServiceTier ? { serviceTier: requestedServiceTier } : {}),
             ...(contextWindow ? { contextWindowTokens: contextWindow } : {}),
             ...(readOnly ? { toolExecutionPolicy: 'read_only' as const } : {}),
-            ...(participation ? { toolExecutionPolicy: 'collective_participation' as const } : {}),
           }),
           tools: Object.freeze({
             finalSurface: readOnly
@@ -2422,7 +2323,7 @@ export class CodexAgentService implements AgentService {
                 ? ('declared_only' as const)
                 : ('unknown' as const),
             ...(declaredMcpServerNames ? { declaredServerNames: Object.freeze(declaredMcpServerNames) } : {}),
-            ...(readOnly ? { catCafeSchemas: Object.freeze([]) } : {}),
+            ...(readOnly || native ? { catCafeSchemas: Object.freeze([]) } : {}),
             schemaDelivery: Object.freeze(schemaDelivery),
           }),
           providerNativeVisibility: 'unknown' as const,
@@ -2667,6 +2568,7 @@ export class CodexAgentService implements AgentService {
             return (async function* () {
               const preparedRequest = prepareProviderRequest(execStdinInput, 'exec_json');
               await options?.beforeProviderLaunch?.(preparedRequest);
+              if (native) await native.assertCurrent();
               if (!('body' in preparedRequest.message)) throw new Error('codex_prepared_message_not_exact');
               const spawnOpts = { ...cliOpts, stdinInput: preparedRequest.message.body };
               const spawned = options?.spawnCliOverride
@@ -3134,7 +3036,7 @@ export class CodexAgentService implements AgentService {
         }
       }
 
-      if (metadata.sessionId && !scopedNative) {
+      if (!native && metadata.sessionId && finalAccountEnv.CODEX_HOME) {
         try {
           const snapshot = await this.contextSnapshotResolver(
             metadata.sessionId,
@@ -3181,7 +3083,7 @@ export class CodexAgentService implements AgentService {
       }
 
       // F172 Phase B: Scan for generated images and publish to /uploads/
-      if (metadata.sessionId && !scopedNative) {
+      if (!native && metadata.sessionId && finalAccountEnv.CODEX_HOME) {
         try {
           const published = await scanAndPublishCodexImages({
             codexSessionId: metadata.sessionId,

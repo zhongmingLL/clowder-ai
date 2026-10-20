@@ -1,5 +1,30 @@
 [
   {
+    "id": "feature-f322-work-discussion",
+    "kind": "feature",
+    "sourceRef": {
+      "path": "docs/features/F322-everyday-work-experience.md",
+      "anchor": "### Phase B: 整理日常主屏"
+    },
+    "structureSource": {
+      "path": "packages/web/src/components/new-conversation/RecentWorks.tsx",
+      "anchor": "RecentWorks"
+    },
+    "bodySource": {
+      "path": "DESIGN.md",
+      "anchor": "往下滚看更多、一键去找做它的猫"
+    },
+    "contexts": ["concierge_open"],
+    "audience": ["cvo"],
+    "body": "想接着聊某件作品？在新对话页往下翻「最近的作品」，点卡片右下「去聊」，会回到交出它的原消息，并把引用和负责猫的 @ 接到原草稿后面。检查后再决定发送；点卡片其它地方仍是打开作品。",
+    "action": {
+      "type": "open_concierge_draft",
+      "label": "了解怎样继续聊作品",
+      "draftPrompt": "请带我从新对话页的最近作品回到它的原消息继续讨论，说明引用和负责猫怎样进入未发送草稿，并保留我原来写的内容。"
+    },
+    "owner": "codex61-sol"
+  },
+  {
     "id": "feature-f328-tripo-background-review",
     "kind": "feature",
     "sourceRef": {
@@ -2134,7 +2159,7 @@
     },
     "contexts": ["feature_dev"],
     "audience": ["cvo", "developer"],
-    "body": "视频插件已就绪：设置 → 插件 → video-gen / video-analysis → 配置 provider 凭据（API Key 或 Access Key + Secret Key）并启用。生成结果可在对话中内联播放，分析结果直接返回文本。",
+    "body": "视频插件已就绪：设置 → 插件 → Video Generation / Video Analysis → 配置 provider 凭据（API Key 或 Access Key + Secret Key）并启用。生成结果可在对话中内联播放，分析结果直接返回文本。",
     "action": {
       "type": "open_source",
       "label": "打开 F205 spec",
@@ -2162,11 +2187,8 @@
     },
     "contexts": ["thinking", "long_running"],
     "audience": ["cvo"],
-    "body": "微信公众号插件已就绪：设置 → 插件 → weixin-mp → 配置 App ID 和 App Secret 并启用。猫猫可以帮你把 Markdown 转成微信格式、上传图片、创建草稿、一键发布文章。",
-    "action": {
-      "type": "open_concierge_draft",
-      "label": "了解更多"
-    },
+    "body": "微信公众号插件已就绪：设置 → 插件 → WeChat Official Account → 配置 App ID 和 App Secret 并启用。猫猫可以帮你把 Markdown 转成微信格式、上传图片、创建草稿、一键发布文章。",
+    "action": { "type": "open_concierge_draft", "label": "了解更多" },
     "owner": "opus"
   },
   {
@@ -2202,7 +2224,7 @@
     "kind": "feature",
     "sourceRef": {
       "path": "docs/features/F292-feishu-meeting-intake-plugin.md",
-      "anchor": "Current activation and repair truth"
+      "anchor": "User Journey"
     },
     "structureSource": {
       "path": "docs/features/F292-feishu-meeting-intake-plugin.md",
@@ -2210,7 +2232,7 @@
     },
     "bodySource": {
       "path": "docs/features/F292-feishu-meeting-intake-plugin.md",
-      "anchor": "Current activation and repair truth"
+      "anchor": "User Journey"
     },
     "contexts": ["thinking", "long_running", "concierge_open"],
     "audience": ["cvo"],
@@ -2246,6 +2268,56 @@
       "surfaceId": "new-conversation"
     },
     "owner": "codex-sol"
+  },
+  {
+    "id": "feature-f202-git-plugin-install",
+    "kind": "feature",
+    "sourceRef": {
+      "path": "docs/architecture/plugin-architecture.md",
+      "anchor": "Git marketplace sources"
+    },
+    "structureSource": {
+      "path": "packages/web/src/components/settings/plugin-manager/PluginGitInstallButton.tsx",
+      "anchor": "PluginGitInstallButton"
+    },
+    "bodySource": {
+      "path": "docs/architecture/plugin-architecture.md",
+      "anchor": "Git marketplace sources"
+    },
+    "contexts": ["feature_dev", "concierge_open"],
+    "audience": ["cvo", "developer"],
+    "body": "到设置 → 插件管理的仓库设置添加 Git 地址与分支，刷新后从插件列表安装。已安装插件只在发现更高兼容版本时显示更新，不提供来源或版本切换器。",
+    "action": {
+      "type": "open_capability_surface",
+      "label": "打开插件管理",
+      "surfaceId": "settings.plugins"
+    },
+    "owner": "codex-sol"
+  },
+  {
+    "id": "feature-f202-local-directory-install",
+    "kind": "feature",
+    "sourceRef": {
+      "path": "docs/architecture/plugin-architecture.md",
+      "anchor": "Local directory installation"
+    },
+    "structureSource": {
+      "path": "packages/web/src/components/settings/plugin-manager/PluginDirectoryInstallButton.tsx",
+      "anchor": "PluginDirectoryInstallButton"
+    },
+    "bodySource": {
+      "path": "docs/architecture/plugin-architecture.md",
+      "anchor": "Settings → 插件集成"
+    },
+    "contexts": ["feature_dev", "concierge_open"],
+    "audience": ["cvo", "developer"],
+    "body": "调试本机插件时，到设置 → 插件集成选择“从本地目录安装”，打开已构建的插件包目录再安装。目录或依赖校验失败会保留错误提示；安装成功后仍需另行启用。",
+    "action": {
+      "type": "open_capability_surface",
+      "label": "打开插件管理",
+      "surfaceId": "settings.plugins"
+    },
+    "owner": "astra"
   },
   {
     "id": "capability-concept-demo-design",
@@ -2570,7 +2642,7 @@
     },
     "contexts": ["thinking", "feature_dev", "concierge_open"],
     "audience": ["cvo", "developer"],
-    "body": "先自己带猫进入 Collective：用本人身份登入，点击连接这台 Café。确认前先看清登记的头像与介绍，取消勾选不想带的猫，再确认连接。获准伙伴进入频道成员栏后，在“我的 Café”管理参与；回到频道点名，以接收状态和具名回复确认它真的接住了。",
+    "body": "用本人身份连接 Café，确认公开资料和要带的猫。在成员页顶部管理我的猫；从频道名菜单设置监听，从共同体菜单管理许可和日程。回到频道点名，用逐猫回执和具名回复确认实际进展。",
     "action": {
       "type": "open_capability_surface",
       "label": "进入 Collective",
@@ -2582,16 +2654,16 @@
     "id": "workflow-collective-result-return",
     "kind": "workflow",
     "sourceRef": {
-      "path": "cat-cafe-skills/collective-participation/SKILL.md",
-      "anchor": "恢复与真实状态"
+      "path": "docs/features/F290-ai-native-collective.md",
+      "anchor": "J0 — 人带第一只猫入场，并完成一次真实协作"
     },
     "structureSource": {
       "path": "packages/web/src/components/collective/CollectiveWorkRequests.tsx",
       "anchor": "CollectiveWorkRequests"
     },
     "bodySource": {
-      "path": "cat-cafe-skills/collective-participation/SKILL.md",
-      "anchor": "丢了响应或换了 invocation"
+      "path": "docs/features/F290-ai-native-collective.md",
+      "anchor": "J0 — 人带第一只猫入场，并完成一次真实协作"
     },
     "contexts": ["long_running", "concierge_open"],
     "audience": ["all"],
@@ -2611,7 +2683,7 @@
       "anchor": "Work 结果反馈与修订"
     },
     "structureSource": {
-      "path": "packages/collective-client/src/CollectiveWorkCard.tsx",
+      "path": "packages/collective-client/src/CollectiveWorkActions.tsx",
       "anchor": "WorkResultReview"
     },
     "bodySource": {
@@ -2829,7 +2901,7 @@
     },
     "contexts": ["concierge_open", "pet_waiting_for_user"],
     "audience": ["all"],
-    "body": "在 Workspace 打开 Markdown 或代码，选一处或几处后点“请猫修改”，在同一个聊天输入框说出想法并发送。图片旁的圈选和画笔也沿用这个聊天；返回的版本可对照后采用或拒绝，保存标记不会直接改写原文件。",
+    "body": "在 Workspace 选中内容后点“请猫修改”，在同一聊天里说明想法；新版可对照后采用或拒绝，标记不会改原件。视频按 F 全屏播放；本机宽屏的“⋯”可在 Finder 中显示或用默认播放器打开原件。",
     "action": {
       "type": "open_source",
       "label": "查看 Workspace 协作说明",

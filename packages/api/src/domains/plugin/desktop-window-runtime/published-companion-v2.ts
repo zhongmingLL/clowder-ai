@@ -91,6 +91,11 @@ export const COMPANION_ARCHIVE_CONTRACTS: readonly CompanionArchiveContract[] = 
     packageDigest: 'sha512-awC/SV1MFVrzZvhS14tJuzQ8ZIS18V2O/W2ufJnE7oka6/oE086jZt4xwuFiz9HhNTcAs3HV4YuJSpsG5DkqXw==',
     contract: '0.1.0-beta.29',
   },
+  {
+    version: '0.1.0-alpha.32',
+    packageDigest: 'sha512-zM9CLwI09/dqa4HM8ubSO+FejF2n307pF2DCiHd+QJ6O4YTuhW6s7FJX0qHxUISRvr872e/urZ/33f+Kk41PBg==',
+    contract: '0.1.0-beta.29',
+  },
 ];
 
 export function isModernCompanionContract(contract: CompanionArchiveContract['contract'] | undefined): boolean {
