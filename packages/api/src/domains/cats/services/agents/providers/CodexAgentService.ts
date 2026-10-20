@@ -592,7 +592,16 @@ const CODEX_SIGNATURE_BOUNDARY_INSTRUCTION =
 
 /** Build the structured Codex reasoning-effort config argument. */
 export function buildCodexReasoningArgs(effortLevel: string): string[] {
-  return ['--config', `model_reasoning_effort=${toTomlString(effortLevel)}`];
+  return effortLevel ? ['--config', `model_reasoning_effort=${toTomlString(effortLevel)}`] : [];
+}
+
+/**
+ * Capability metadata needs a non-empty model family even when a native Codex
+ * member intentionally inherits the local CLI model (represented as empty).
+ * This projection never changes launch arguments or persisted member config.
+ */
+export function resolveCodexSchemaModelFamily(model: string | null | undefined): string {
+  return model?.trim() || 'unknown';
 }
 
 /**
@@ -1683,23 +1692,22 @@ export class CodexAgentService implements AgentService {
           };
     /** exec_json can only carry frozen bytes; undefined means "preflight, app_server only". */
     const execStdinInput = effectivePromptSource.kind === 'frozen' ? effectivePromptSource.prompt : undefined;
-    const effectiveModel = options?.callbackEnv?.CAT_CAFE_OPENAI_MODEL_OVERRIDE ?? this.model;
-    const imagePaths = await extractTrustedImagePaths(
-      options?.contentBlocks,
-      options?.uploadDir,
-      options?.resolveTrustedImagePath,
-    );
+    const nativeTool = catRegistry.tryGet(this.catId)?.config.configurationSource === 'native_tool';
+    const effectiveModel =
+      options?.callbackEnv?.CAT_CAFE_OPENAI_MODEL_OVERRIDE ?? (nativeTool ? getCatModel(this.catId) : this.model);
+    const imagePaths = native
+      ? []
+      : await extractTrustedImagePaths(options?.contentBlocks, options?.uploadDir, options?.resolveTrustedImagePath);
     const imageArgs = imagePaths.flatMap((path) => ['--image', path]);
 
     const sandboxMode = readOnly || live || native ? 'read-only' : getCodexSandboxMode();
     const approvalPolicy = readOnly || live || native ? 'never' : getCodexApprovalPolicy();
     const inheritedEffort = getCatEffort(this.catId as string, undefined, 'openai', effectiveModel);
-    const effortLevel = resolveCliEffortOverride(
-      'openai',
-      effectiveModel,
-      inheritedEffort,
-      options?.reasoningEffortOverride,
-    ).effective;
+    const effortLevel =
+      nativeTool && !inheritedEffort && !options?.reasoningEffortOverride
+        ? ''
+        : resolveCliEffortOverride('openai', effectiveModel, inheritedEffort, options?.reasoningEffortOverride)
+            .effective;
     const reasoningArgs = buildCodexReasoningArgs(effortLevel);
     const sandboxConfigArgs = ['--config', `sandbox_mode=${toTomlString(sandboxMode)}`];
     const approvalArgs = ['--config', `approval_policy="${approvalPolicy}"`];
@@ -1809,7 +1817,9 @@ export class CodexAgentService implements AgentService {
     });
     const catalogRequested = carrierMode === 'exec_json' && isCodexCustomCatalogModel(effectiveModel);
     const catalogApplied = modelCatalogArgs.length > 0;
-    const authMode = options?.codexAccountLaunch?.authMode ?? getCodexAuthMode(options?.callbackEnv);
+    const authMode =
+      options?.codexAccountLaunch?.authMode ??
+      (nativeTool && !options?.callbackEnv?.CODEX_AUTH_MODE ? 'auto' : getCodexAuthMode(options?.callbackEnv));
     const requestedServiceTier = resolveCodexSpeed({
       clientId: 'openai',
       authType: authMode === 'oauth' || authMode === 'api_key' ? authMode : undefined,
@@ -1864,11 +1874,11 @@ export class CodexAgentService implements AgentService {
       servedModelObservation === 'on';
     const oauthTransport = getCodexOAuthTransport();
     const builtinOpenaiProviderArgs: string[] =
-      !customBaseUrl && authMode === 'oauth' && oauthTransport === 'builtin'
+      !nativeTool && !customBaseUrl && authMode === 'oauth' && oauthTransport === 'builtin'
         ? ['--config', 'model_provider="openai"']
         : [];
     const openaiHttpsProviderArgs: string[] =
-      !customBaseUrl && authMode === 'oauth' && oauthTransport === 'https'
+      !nativeTool && !customBaseUrl && authMode === 'oauth' && oauthTransport === 'https'
         ? [
             '--config',
             'model_provider="openai_https"',
@@ -1955,23 +1965,16 @@ export class CodexAgentService implements AgentService {
       : options?.routeIntent && options.sessionId
         ? 'default'
         : null;
-    const collaborationMode =
-      collaborationModeKind && cliModel
-        ? {
-            mode: collaborationModeKind,
-            settings: {
-              model: cliModel,
-              reasoning_effort: effortLevel,
-              developer_instructions: developerInstructions,
-            },
-          }
-        : undefined;
-    if (carrierMode === 'app_server' && collaborationModeKind && !cliModel) {
-      log.warn(
-        { catId: this.catId, collaborationMode: collaborationModeKind },
-        'F306 route cannot set Codex collaboration mode without a selected model',
-      );
-    }
+    const collaborationMode = collaborationModeKind
+      ? {
+          mode: collaborationModeKind,
+          settings: {
+            model: cliModel,
+            ...(effortLevel ? { reasoning_effort: effortLevel } : {}),
+            developer_instructions: developerInstructions,
+          },
+        }
+      : undefined;
     const developerInstructionsArgs = ['--config', `developer_instructions=${toTomlString(developerInstructions)}`];
     const appsWriteApprovalArgs = readOnly || live || native ? [] : [...CODEX_APPS_WRITE_APPROVAL_ARGS];
     const desktopIsolationArgs = [
@@ -2157,7 +2160,9 @@ export class CodexAgentService implements AgentService {
         }
       }
       const homeIsolated = !!native || (authMode === 'api_key' && !!customBaseUrl);
-      const codexEnv = native ? { ...native.env } : withVerdictGhGuardEnv(applyAuthMode(rawEnv, authMode));
+      const codexEnv = native
+        ? { ...native.env }
+        : withVerdictGhGuardEnv(nativeTool ? rawEnv : applyAuthMode(rawEnv, authMode));
 
       // Diagnostic logging: critical env state for debugging CLI startup failures
       log.info(
@@ -2311,7 +2316,7 @@ export class CodexAgentService implements AgentService {
         command: codexCommand,
         provider: 'openai',
         carrier: useAppServer ? 'app_server' : 'exec_json',
-        modelFamily: cliModel ?? 'provider-default',
+        modelFamily: resolveCodexSchemaModelFamily(cliModel),
         profileClass: schemaDeliveryProfile,
         profileId: schemaDeliveryProfileId,
         config: createMcpSchemaDeliveryLaunchConfig({
@@ -2344,7 +2349,7 @@ export class CodexAgentService implements AgentService {
             carrier,
             ...(cliModel ? { model: cliModel } : {}),
             protocol: carrier === 'app_server' ? 'json_rpc' : 'exec_json',
-            reasoningEffort: effortLevel,
+            reasoningEffort: effortLevel || undefined,
             ...(requestedServiceTier ? { serviceTier: requestedServiceTier } : {}),
             ...(contextWindow ? { contextWindowTokens: contextWindow } : {}),
             ...(readOnly ? { toolExecutionPolicy: 'read_only' as const } : {}),

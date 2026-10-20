@@ -352,7 +352,7 @@ export class ClaudeInteractivePtyCarrierService implements AgentService {
             carrier: 'interactive_pty',
             ...(effectiveModel ? { model: effectiveModel } : {}),
             protocol: 'pty_hooks',
-            reasoningEffort: effortLevel,
+            ...(effortLevel ? { reasoningEffort: effortLevel } : {}),
             ...(readOnly ? { toolExecutionPolicy: 'read_only' as const } : {}),
           }),
           tools: Object.freeze({
