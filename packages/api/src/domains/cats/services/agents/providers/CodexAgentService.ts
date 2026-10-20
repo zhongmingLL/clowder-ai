@@ -1,6 +1,7 @@
 import type { RuntimeProviderProfile } from '../../../../../config/account-resolver.js';
 import { finalizeCodexAccountEnvironment } from '../../../../../config/codex-account-environment.js';
 import { resolveCodexAccountLaunch, resolveCodexApiExecutionHome } from '../../../../../config/codex-account-launch.js';
+import { codexCliConfig } from '../../../../../config/codex-launch-config.js';
 import { codexManagedLaunchArgs } from '../../../../../config/codex-managed-launch.js';
 import { assertCodexManagedPlatformSupport } from '../../../../../config/codex-managed-support.js';
 import { assertCodexSharedStateRoots } from '../../../../../config/codex-shared-state.js';
@@ -662,22 +663,25 @@ function configKey(expression: string): string {
   return (equalsIndex === -1 ? expression : expression.slice(0, equalsIndex)).trim();
 }
 
-/** Mirrors Codex's `tools.update_plan.enabled` resolution for this invocation. */
+/**
+ * Mirrors Codex's final `tools.update_plan.enabled` resolution for this
+ * invocation. The CLI applies every accepted `-c/--config` assignment in
+ * order, so a later duplicate leaf wins and a later parent-table assignment
+ * replaces the whole subtree (including dropping `update_plan`). Reuse the
+ * same dotted-path/TOML parser as the launch-config projection instead of
+ * scanning for the first matching leaf.
+ */
 function isCodexUpdatePlanEnabled(args: readonly string[]): boolean {
-  for (let index = 0; index < args.length; index++) {
-    const parsed = parseCodexConfigArg(args, index);
-    if (!parsed) continue;
-    index += parsed.tokenCount - 1;
-    if (configKey(parsed.expression) !== 'tools.update_plan.enabled') continue;
-    const equalsIndex = parsed.expression.indexOf('=');
-    if (equalsIndex === -1) return false;
-    const value = parsed.expression
-      .slice(equalsIndex + 1)
-      .trim()
-      .replace(/^["']|["']$/g, '');
-    return value.toLowerCase() === 'true';
+  try {
+    const config = codexCliConfig(args);
+    const tools = config.tools;
+    if (!isCodexConfigObject(tools)) return false;
+    const updatePlan = tools.update_plan;
+    if (!isCodexConfigObject(updatePlan)) return false;
+    return updatePlan.enabled === true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 /** Parse every documented/accepted spelling of Codex's model value flag. */
