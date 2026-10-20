@@ -12,6 +12,12 @@
  * Regenerate: capture the 'instructions' field of a codex exec request for a
  * model with fallback metadata through a local capture proxy, then rebuild
  * this file with the same line-array shape.
+ *
+ * Invariant: the joined text is 20_750 characters, byte-identical to the
+ * fallback template extracted from the codex-cli 0.163.0 binary (0.163.0 is
+ * also the version the catalog replacement semantics were re-verified on).
+ * A join separator other than a bare newline breaks this silently, so the
+ * separator has its own regression test.
  */
 
 /* eslint-disable */
@@ -292,4 +298,4 @@ export const CODEX_FALLBACK_MODEL_INSTRUCTIONS: string = [
   'When steps have been completed, use `update_plan` to mark each finished step as `completed` and the next step you are working on as `in_progress`. There should always be exactly one `in_progress` step until everything is done. You can mark multiple items as complete in a single `update_plan` call.',
   '',
   'If all steps are complete, ensure you call `update_plan` to mark all steps as `completed`.',
-].join("'\n'");
+].join('\n');
