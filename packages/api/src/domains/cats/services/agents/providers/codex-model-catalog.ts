@@ -71,6 +71,12 @@ const DEEPSEEK_FLASH_REASONING_LEVELS = [
   { effort: 'max', description: 'Maximum reasoning depth for the hardest problems' },
 ];
 
+/**
+ * NEVER add a model that Codex ships in its own built-in catalog here: the flag
+ * REPLACES that catalog wholesale, so registering a builtin slug would
+ * silently drop every built-in entry for that invocation. Membership in this
+ * map *is* the gate.
+ */
 export const CODEX_CUSTOM_MODEL_CATALOG_ENTRIES: Readonly<Record<string, CodexModelCatalogEntry>> = {
   'deepseek-flash': {
     slug: 'deepseek-flash',
