@@ -18,13 +18,18 @@ import { prepareOpenCodeAcpSpawnConfig } from '../opencode-acp-spawn-config.js';
 import { AcpAgentService } from './AcpAgentService.js';
 import { AcpClient } from './AcpClient.js';
 import { AcpHttpStreamClient } from './AcpHttpStreamClient.js';
-import { AcpProcessPool, DEFAULT_ACP_IDLE_TTL_MS, type PoolKey } from './AcpProcessPool.js';
-import { resolveAcpBootstrapArgs, resolveAcpBootstrapCommand, resolveAcpBootstrapCwd } from './acp-bootstrap-cwd.js';
+import { AcpProcessPool, DEFAULT_ACP_IDLE_TTL_MS } from './AcpProcessPool.js';
 // resolveAcpMcpServers + resolveDisabledServerIds moved to AcpAgentService.invoke()
 // for invoke-time resolution (#712 P1-1).
 import { createAcpPoolSpawnSignature } from './acp-pool-signature.js';
 import { skipAcpProfile } from './acp-registration-failure.js';
 import { tryPrepareAcpProcessEnv } from './acp-spawn-env.js';
+import {
+  type AcpBootstrapContext,
+  resolveAcpBootstrap,
+  type VerifiedAcpBootstrapContext,
+  verifyAcpBootstrap,
+} from './bootstrap/acp-bootstrap-context.js';
 
 export type AcpPoolRegistry = Map<string, AcpProcessPool>;
 
@@ -41,15 +46,6 @@ export interface CreateAcpServiceForConfigInput {
   bootstrapRoot?: string;
   /** Carry a safe registration failure to the router while leaving this service absent. */
   onUnavailable?: (reason: AgentRegistrationFailure) => void;
-}
-
-interface AcpBootstrapContext {
-  projectRoot: string;
-  command: string;
-  args: string[];
-  cwd: string;
-  model?: string;
-  poolKey: PoolKey;
 }
 
 interface AcpAccountContext {
@@ -85,28 +81,6 @@ function resolveAcpContextPolicy(config: CatConfig, effectiveModel: string): Acp
     windowTokens: resolved ? capacity.windowTokens : null,
     inputCeilingTokens: resolved ? capacity.inputCeilingTokens : null,
     source: capacity.source,
-  };
-}
-
-function resolveAcpBootstrap(
-  projectRoot: string,
-  profileId: string,
-  acpConfig: AcpVariantConfig,
-  effectiveModel: string,
-  bootstrapRoot?: string,
-): AcpBootstrapContext {
-  const model = effectiveModel.trim() || undefined;
-  const args = resolveAcpBootstrapArgs(projectRoot, acpConfig.startupArgs, {
-    base_model: model,
-    model,
-  });
-  return {
-    projectRoot,
-    command: resolveAcpBootstrapCommand(projectRoot, acpConfig.command),
-    args,
-    cwd: resolveAcpBootstrapCwd(projectRoot, profileId, bootstrapRoot),
-    model,
-    poolKey: { projectPath: projectRoot, providerProfile: profileId },
   };
 }
 
@@ -201,7 +175,7 @@ async function prepareAcpSpawnContext(
 
 async function ensureAcpPool(
   input: CreateAcpServiceForConfigInput,
-  bootstrap: AcpBootstrapContext,
+  bootstrap: VerifiedAcpBootstrapContext,
   spawn: AcpSpawnContext,
 ): Promise<AcpProcessPool> {
   const { profileId, acpConfig, poolRegistry } = input;
@@ -209,6 +183,7 @@ async function ensureAcpPool(
     command: bootstrap.command,
     args: bootstrap.args,
     cwd: bootstrap.cwd,
+    bootstrapIsolation: bootstrap.isolation,
     env: spawn.env ?? null,
     openCodeRuntimeConfig: spawn.openCodeRuntimeConfig,
     contextPolicy: spawn.contextPolicy,
@@ -240,7 +215,8 @@ async function ensureAcpPool(
         args: bootstrap.args,
         // Cold starts must recreate a lost cwd and revalidate its permissions.
         // Existing live processes keep their cwd and drain under pool policy.
-        cwd: resolveAcpBootstrapCwd(bootstrap.projectRoot, profileId, input.bootstrapRoot),
+        cwd: bootstrap.verifyCwd(),
+        ...(process.platform === 'win32' ? { verifyBootstrapCwd: bootstrap.verifyCwd } : {}),
         ...(spawn.env ? { env: spawn.env } : {}),
       };
       return acpConfig.transport === 'httpstream' ? new AcpHttpStreamClient(clientCfg) : new AcpClient(clientCfg);
@@ -271,7 +247,7 @@ export async function createAcpServiceForConfig(
     );
   }
 
-  const bootstrap = resolveAcpBootstrap(projectRoot, profileId, acpConfig, effectiveModel, input.bootstrapRoot);
+  const bootstrap = resolveAcpBootstrap(projectRoot, profileId, acpConfig, effectiveModel);
   let accountContext: AcpAccountContext;
   try {
     accountContext = resolveAcpAccount(bootstrap.projectRoot, config);
@@ -306,7 +282,8 @@ export async function createAcpServiceForConfig(
   }
   const spawn = await saveSpan('acp.prepare', () => prepareAcpSpawnContext(effectiveInput, bootstrap, accountContext));
   if (!spawn) return null;
-  const pool = await saveSpan('acp.pool', () => ensureAcpPool(effectiveInput, bootstrap, spawn));
+  const verified = verifyAcpBootstrap(bootstrap, profileId, input.bootstrapRoot, spawn.env);
+  const pool = await saveSpan('acp.pool', () => ensureAcpPool(effectiveInput, verified, spawn));
 
   // #712 P1-1: pass whitelist — MCP resolution happens at invoke time in
   // AcpAgentService so capability toggles take effect without registry rebuild.
