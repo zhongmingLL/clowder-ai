@@ -1,3 +1,6 @@
+import { type CloudBindingRefusal, catRegistry } from '@cat-cafe/shared';
+import { resolveCloudConversationCat } from '../domains/cats/services/cloud-bridge/cloud-conversation-identity.js';
+import { pluginPrTitleReader } from './plugin/pr-artifact-title-reader.js';
 /**
  * Thread API Routes
  * POST   /api/threads     - 创建对话
@@ -16,6 +19,7 @@ import type { InvocationQueue } from '../domains/cats/services/agents/invocation
 import type { InvocationTracker } from '../domains/cats/services/agents/invocation/InvocationTracker.js';
 import type { QueueProcessor } from '../domains/cats/services/agents/invocation/QueueProcessor.js';
 import type { TaskProgressStore } from '../domains/cats/services/agents/invocation/TaskProgressStore.js';
+import { readGlobalWorksPage, WorksPageError } from '../domains/cats/services/agents/routing/global-works-page.js';
 import { collectRecentGlobalWorkCandidates } from '../domains/cats/services/agents/routing/recent-global-work-reader.js';
 import {
   type PrTitleReader,
@@ -55,6 +59,7 @@ import type {
 } from '../domains/cats/services/stores/ports/ThreadStore.js';
 import {
   isDurableOwnerReadEvidence,
+  isThreadMessageVisibleToViewer,
   passesManagedHoldViewerBoundary,
   SYSTEM_USER_IDS,
 } from '../domains/cats/services/stores/visibility.js';
@@ -89,6 +94,13 @@ const recentWorksQuerySchema = z
   })
   .strict();
 const worksQuerySchema = z.object({ view: z.literal('works') }).strict();
+const pagedWorksQuerySchema = z
+  .object({
+    view: z.literal('works'),
+    read: z.literal('pages'),
+    cursor: z.string().min(1).max(4096).optional(),
+  })
+  .strict();
 
 type StoredReadCoordinateAssessment =
   | { kind: 'valid'; primary: NonNullable<ReturnType<typeof parseCursor>> }
@@ -670,6 +682,7 @@ const bootcampStateSchema = z
       .optional(),
     advancedFeatures: z.record(z.enum(['available', 'unavailable', 'skipped'])).optional(),
     startedAt: z.number(),
+    journeyId: z.string().min(8).max(200).optional(),
     completedAt: z.number().optional(),
   })
   .strict();
@@ -927,6 +940,25 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
       return { error: 'Identity required (session cookie or X-Cat-Cafe-User header)' };
     }
 
+    const onboardingJourneyId = request.headers['x-cat-cafe-onboarding-journey'];
+    const onboardingIdempotencyKey = request.headers['idempotency-key'];
+    const headerJourneyId = typeof onboardingJourneyId === 'string' ? onboardingJourneyId : undefined;
+    const keyJourneyId =
+      typeof onboardingIdempotencyKey === 'string' && onboardingIdempotencyKey.startsWith('onboarding:')
+        ? onboardingIdempotencyKey.slice('onboarding:'.length)
+        : undefined;
+    const journeyId = headerJourneyId ?? bootcampState?.journeyId ?? keyJourneyId;
+    if (journeyId !== undefined && (journeyId.length < 8 || journeyId.length > 200)) {
+      reply.status(400);
+      return { error: 'Invalid onboarding journey id' };
+    }
+    if (journeyId) {
+      const existing = (await threadStore.list(userId)).find(
+        (candidate) => candidate.bootcampState?.journeyId === journeyId,
+      );
+      if (existing) return sanitizeThreadForResponse(existing, userId);
+    }
+
     const resolvedProjectPath = await resolveCreateThreadProjectPath(projectPath, bootcampState as BootcampStateV1);
     if (!resolvedProjectPath.ok) {
       reply.status(resolvedProjectPath.statusCode);
@@ -934,6 +966,21 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
     }
 
     let thread: Thread;
+    if (journeyId && threadStore.ensureOnboardingThread) {
+      const ensured = await threadStore.ensureOnboardingThread(
+        userId,
+        journeyId,
+        title ?? '首启协作旅程',
+        resolvedProjectPath.projectPath ?? 'default',
+        bootcampState as BootcampStateV1,
+      );
+      if (ensured.thread.createdBy !== userId) {
+        reply.status(409);
+        return { error: 'Onboarding journey belongs to another user' };
+      }
+      reply.status(ensured.created ? 201 : 200);
+      return sanitizeThreadForResponse(ensured.thread, userId);
+    }
     if (idempotencyKey) {
       try {
         thread = await threadStore.ensureOwnedThread({
@@ -1405,7 +1452,10 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
       return { error: 'Only the thread owner can read cloud cat bindings' };
     }
     const bindings = await threadStore.getCloudCatBindings(id);
-    return { bindings };
+    // F202 h3c-2: which cat's binding is the thread's ChatGPT conversation is the Host's answer, not
+    // a fixed id — the panel lists the binding of the configured cloud cat, and none when the
+    // provider has no cat or several.
+    return { bindings, cloudCat: resolveCloudConversationCat(catRegistry, 'chatgpt') };
   });
 
   // PATCH /api/threads/:id/cloud-bindings — STRICT user-owned only.
@@ -1414,34 +1464,51 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
   //
   // Auth model: same 4 layers as GET (strict resolver / reserved-identity reject /
   // system-thread reject / literal owner match). See GET doc above for history.
+  //
+  // F202 h3c-1: every refusal carries a `CloudBindingRefusal` code, and only these checks — all made
+  // before the write — send one. A client reads such a refusal as "nothing was written"; any other
+  // failure leaves the outcome unknown, and the client reads the binding back.
   app.patch<{ Params: { id: string } }>('/api/threads/:id/cloud-bindings', async (request, reply) => {
     const { id } = request.params;
     const userId = resolveStrictUserId(request);
     if (!userId) {
       reply.status(401);
-      return { error: 'Authentication required' };
+      return { error: 'Authentication required', code: 'CLOUD_BINDING_AUTH_REQUIRED' satisfies CloudBindingRefusal };
     }
     if (SYSTEM_USER_IDS.has(userId)) {
       reply.status(401);
-      return { error: 'Reserved internal identity cannot be used' };
+      return {
+        error: 'Reserved internal identity cannot be used',
+        code: 'CLOUD_BINDING_RESERVED_IDENTITY' satisfies CloudBindingRefusal,
+      };
     }
     const parseResult = cloudBindingPatchSchema.safeParse(request.body);
     if (!parseResult.success) {
       reply.status(400);
-      return { error: 'Invalid request body', details: parseResult.error.issues };
+      return {
+        error: 'Invalid request body',
+        code: 'CLOUD_BINDING_INVALID_BODY' satisfies CloudBindingRefusal,
+        details: parseResult.error.issues,
+      };
     }
     const thread = await threadStore.get(id);
     if (!thread || thread.deletedAt) {
       reply.status(404);
-      return { error: 'Thread not found' };
+      return { error: 'Thread not found', code: 'CLOUD_BINDING_THREAD_NOT_FOUND' satisfies CloudBindingRefusal };
     }
     if (SYSTEM_USER_IDS.has(thread.createdBy)) {
       reply.status(403);
-      return { error: 'Cloud cat bindings are not supported on system-owned threads' };
+      return {
+        error: 'Cloud cat bindings are not supported on system-owned threads',
+        code: 'CLOUD_BINDING_SYSTEM_THREAD' satisfies CloudBindingRefusal,
+      };
     }
     if (thread.createdBy !== userId) {
       reply.status(403);
-      return { error: 'Only the thread owner can update cloud cat bindings' };
+      return {
+        error: 'Only the thread owner can update cloud cat bindings',
+        code: 'CLOUD_BINDING_NOT_OWNER' satisfies CloudBindingRefusal,
+      };
     }
     const { catId, chatUrl } = parseResult.data;
     await threadStore.updateCloudCatBinding(id, catId as CatId, chatUrl);
@@ -1629,7 +1696,7 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
         prTasks,
         fileLedger: worksView ? [] : fileLedger,
       }),
-      worksView ? opts.prTitleReader : undefined,
+      worksView ? (opts.prTitleReader ?? pluginPrTitleReader(app, request)) : undefined,
     );
     const projected = await projectGlobalArtifactWorkLineage(
       opts.artifactWorkLineage,
@@ -1650,6 +1717,55 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
     };
   });
 
+  // F232 PR-A: GET /api/threads/:threadId/artifacts/:messageId/blocks/:blockId — read one html_widget.
+  // Same identity, thread admission and message visibility as the catalogue route directly above;
+  // a block the catalogue lists must be readable, and a block it cannot list must not be.
+  app.get<{ Params: { threadId: string; messageId: string; blockId: string } }>(
+    '/api/threads/:threadId/artifacts/:messageId/blocks/:blockId',
+    async (request, reply) => {
+      reply.header('Cache-Control', 'private, no-store');
+      const userId = resolveUserId(request, {});
+      if (!userId) {
+        reply.status(401);
+        return { error: 'Identity required' };
+      }
+      const { threadId, messageId, blockId } = request.params;
+      const thread = await threadStore.get(threadId);
+      if (!thread) {
+        reply.status(404);
+        return { error: 'Thread not found' };
+      }
+      if (thread.createdBy !== userId && thread.createdBy !== 'system') {
+        reply.status(403);
+        return { error: 'Access denied' };
+      }
+      const message = messageStore ? await messageStore.getById(messageId) : null;
+      // One response for "not this thread", "not visible to you" and "no such block":
+      // never leak whether the message exists outside the catalogue.
+      if (!message || message.threadId !== threadId || !isThreadMessageVisibleToViewer(message, userId)) {
+        reply.status(404);
+        return { error: 'widget_block_unavailable' };
+      }
+      const block = (message.extra?.rich?.blocks ?? []).find((candidate) => candidate.id === blockId);
+      if (!block || block.kind !== 'html_widget') {
+        reply.status(404);
+        return { error: 'widget_block_unavailable' };
+      }
+      return {
+        threadId,
+        messageId,
+        block: {
+          id: block.id,
+          kind: block.kind,
+          v: block.v,
+          html: block.html,
+          ...(block.title === undefined ? {} : { title: block.title }),
+          ...(block.height === undefined ? {} : { height: block.height }),
+        },
+      };
+    },
+  );
+
   // F232 Phase B: GET /api/artifacts — global artifact aggregation across all user threads (AC-B1, AC-B2).
   // Projects each historical page, reusing the full Phase A artifact aggregation contract.
   app.get('/api/artifacts', async (request, reply) => {
@@ -1660,6 +1776,47 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
     }
 
     const rawQuery = request.query as Record<string, unknown>;
+    if (rawQuery.view === 'works' && rawQuery.read === 'pages') {
+      const query = pagedWorksQuerySchema.safeParse(rawQuery);
+      if (!query.success) return reply.code(400).send({ error: 'Invalid paged works query' });
+      const started = performance.now();
+      try {
+        const page = await readGlobalWorksPage({
+          userId,
+          cursor: query.data.cursor,
+          threads: await threadStore.list(userId),
+          messages: messageStore,
+          tasks: taskStore,
+          accepted: async (threadId, messages) => {
+            const result = await readAcceptedWorkspaceArtifacts(
+              opts.acceptedWorkspaceArtifacts,
+              userId,
+              threadId,
+              projectAppliedWorkspaceReceipts(messages),
+            );
+            if (!result.complete) throw new WorksPageError('Accepted work source unavailable', 503);
+            return result.artifacts;
+          },
+        });
+        const artifacts = await readArtifactPrTitles(page.artifacts, opts.prTitleReader);
+        const projected = await projectGlobalArtifactWorkLineage(opts.artifactWorkLineage, userId, artifacts);
+        request.log.info(
+          { worksPage: { ...page.cost, durationMs: performance.now() - started, complete: page.complete } },
+          'Bounded global works page',
+        );
+        return {
+          artifacts: projected.artifacts,
+          workLineage: projected.workLineage,
+          pageTotal: projected.artifacts.length,
+          view: 'works',
+          complete: page.complete,
+          ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+        };
+      } catch (error) {
+        if (error instanceof WorksPageError) return reply.code(error.statusCode).send({ error: error.message });
+        throw error;
+      }
+    }
     const worksView = rawQuery.view === 'works';
     if (worksView && !worksQuerySchema.safeParse(rawQuery).success)
       return reply.code(400).send({ error: 'Invalid works view query' });
@@ -1737,7 +1894,10 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
       rawQuery as { type?: string; cat?: string; q?: string | string[] },
     );
 
-    const titled = await readArtifactPrTitles(all, worksView ? opts.prTitleReader : undefined);
+    const titled = await readArtifactPrTitles(
+      all,
+      worksView ? (opts.prTitleReader ?? pluginPrTitleReader(app, request)) : undefined,
+    );
     const projected = await projectGlobalArtifactWorkLineage(opts.artifactWorkLineage, userId, titled);
     return worksView
       ? {

@@ -21,7 +21,7 @@ test('api build uses the public native command without the prepared-artifact wra
   assert.equal(typeof buildScript, 'string');
   assert.doesNotMatch(buildScript, /gate-prepared-artifacts/);
   assert.match(buildScript, /pnpm --dir \.\.\/shared build/);
-  assert.match(buildScript, /pnpm --dir \.\.\/collective-service build/);
+  assert.doesNotMatch(buildScript, /collective-service|collective-connector/);
   assert.match(buildScript, /node \.\/scripts\/copy-marketplace-catalog-data\.mjs/);
   assert.doesNotMatch(buildScript, /\bmkdir -p\b/);
   assert.doesNotMatch(buildScript, /\bcp\s+src\/marketplace\/catalog-data/);
@@ -79,20 +79,19 @@ test('desktop package includes the full main process local require dependency gr
   assert.deepEqual([...new Set(missing)].sort(), []);
 });
 
-test('windows desktop build script cleans up temporary Defender exclusions', async () => {
+test('windows desktop packaging uses frozen export without changing Defender settings', async () => {
   const buildScript = await readFile(desktopBuildScriptPath, 'utf8');
-
-  assert.match(buildScript, /Add-MpPreference -ExclusionPath \$deployRoot/);
-  assert.match(buildScript, /Remove-MpPreference -ExclusionPath \$deployRoot/);
-  assert.match(buildScript, /finally\s*\{[\s\S]*Remove-MpPreference -ExclusionPath \$deployRoot[\s\S]*\}/);
+  assert.match(buildScript, /frozen-runtime-deploy\.mjs/);
+  assert.doesNotMatch(buildScript, /Add-MpPreference|Remove-MpPreference/);
 });
 
-test('windows desktop build script retries pnpm deploy on EPERM', async () => {
+test('desktop packaging retains the previous deployment on a new frozen export', async () => {
   const buildScript = await readFile(desktopBuildScriptPath, 'utf8');
-
-  assert.match(buildScript, /for \(\$attempt = 1; \$attempt -le 3/);
-  assert.match(buildScript, /Start-Sleep -Seconds 10/);
-  assert.match(buildScript, /Remove-Item \$out -Recurse -Force/);
+  assert.match(buildScript, /Move-Item -LiteralPath \$deployRoot -Destination/);
+  assert.match(buildScript, /deploy-before-/);
+  assert.ok(
+    buildScript.indexOf('Frozen runtime export failed') < buildScript.indexOf('Move-Item -LiteralPath $deployRoot'),
+  );
 });
 
 test('windows desktop build script downloads official Inno Setup ChineseSimplified language file', async () => {
@@ -109,12 +108,14 @@ test('windows desktop build script downloads official Inno Setup ChineseSimplifi
   );
 });
 
-test('windows desktop build script Defender cleanup runs in finally block', async () => {
-  const buildScript = await readFile(desktopBuildScriptPath, 'utf8');
-
-  const finallyMatch = buildScript.match(/finally\s*\{([\s\S]*?)\}\s*\n\s*if \(\$deployFailed\)/);
-  assert.ok(finallyMatch, 'finally block with cleanup must exist');
-  assert.match(finallyMatch[1], /Remove-MpPreference -ExclusionPath \$deployRoot/);
+test('desktop build fails closed when source locks do not match', async () => {
+  for (const file of [desktopBuildScriptPath, desktopMacBuildScriptPath]) {
+    const buildScript = await readFile(file, 'utf8');
+    assert.match(buildScript, /pnpm install --frozen-lockfile/);
+    assert.match(buildScript, /Frozen dependency installation failed/);
+    assert.doesNotMatch(buildScript, /if.*LASTEXITCODE.*pnpm install/);
+    assert.doesNotMatch(buildScript, /retrying with pnpm install/);
+  }
 });
 
 test('F210 desktop packaging does not bundle Gemini CLI as AGY replacement', async () => {

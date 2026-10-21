@@ -39,10 +39,6 @@ import type {
   SchedulerMessageExtra,
 } from '@cat-cafe/shared';
 import {
-  collectiveOwnerAdmissionV1Schema,
-  collectiveSourceIdentitySchema,
-  collectiveWorkDelegationV1Schema,
-  collectiveWorkInvocationV1Schema,
   custodyOfferV1Schema,
   entrustedWorkHumanTerminalReceiptV1Schema,
   evolutionPreparationSubmissionV1Schema,
@@ -65,8 +61,14 @@ import {
   type LifecycleAppendRecoveryResult,
   prepareLifecycleAppendRecovery,
 } from '../lifecycle-append-recovery.js';
+import {
+  type LifecycleWakeCoverageInput,
+  type LifecycleWakeCoverageResult,
+  prepareLifecycleWakeCoverage,
+} from '../lifecycle-wake-coverage.js';
 import type { MessageDeliveryBoundary } from '../message-delivery-boundary.js';
 import { messageFrom } from '../message-from.js';
+import { storedMessageSource } from '../message-source.js';
 import { notifyMessageTimelineChange } from '../notify-message-timeline-change.js';
 import { type UserMentionHandlingMetadata, UserMentionIndex } from '../user-mention-index.js';
 import {
@@ -78,6 +80,7 @@ import {
   resolveDeliveryTimelineScore,
   resolveThreadMessageVisibility,
 } from '../visibility.js';
+import { ThreadMessageTimelineIndex } from './ThreadMessageTimelineIndex.js';
 // Single source of truth: ThreadStore.ts owns DEFAULT_THREAD_ID
 import { DEFAULT_THREAD_ID } from './ThreadStore.js';
 import type { TurnExecutionMessageProjection } from './TurnExecutionStore.js';
@@ -114,6 +117,8 @@ export interface MessageIdScanPage {
 export const COORDINATION_TERMINAL_SCAN_PAGE_SIZE = 100;
 
 export interface ThreadMessageReadOptions {
+  /** Artifact reads need publication/visibility/receipt fields, never conversation text or tool traces. */
+  artifactProjection?: boolean;
   /** Include queued cat-authored speech that is already published to the timeline. */
   includeQueuedCatMessages?: boolean;
   /** Include durable queued owner work (user or Host connector ingress) in the browser timeline only. */
@@ -248,6 +253,8 @@ export interface StoredToolEvent {
   type: 'tool_use' | 'tool_result';
   label: string;
   detail?: string;
+  /** Finalized call input carried by a result; replaces provisional use detail without adding a call. */
+  inputDetail?: string;
   timestamp: number;
   /** F153 Phase J AC-J7: native provider tool id, used to pair tool_use ↔ tool_result
    *  and to key the synthesized span on hydrate. Set by provider transformer via
@@ -312,6 +319,11 @@ export interface StoredMessage {
       parentInvocationId: string;
       isFailureReport: boolean;
     };
+    /** Additional callers actually covered by this same response, with admission provenance. */
+    coveredA2AFailureReturns?: Omit<
+      NonNullable<NonNullable<StoredMessage['extra']>['a2aFailureReturn']>,
+      'parentInvocationId'
+    >[];
     /** Immutable Live ingress receipt, not executable media or an ownership record. */
     liveAdmission?: { sessionId: string; targetId: string };
     /** HTTP conversation request provenance; prose expansion is derived, explicit selection is identity. */
@@ -344,11 +356,7 @@ export interface StoredMessage {
         }
     );
     /** F290: canonical owner receipt and exact Task execution trigger; written by owner admission routes only. */
-    collectiveOwnerAdmissionV1?: import('@cat-cafe/shared').CollectiveOwnerAdmissionV1;
-    collectiveWorkInvocationV1?: import('@cat-cafe/shared').CollectiveWorkInvocationV1;
     /** F290: authenticated Task owner explicitly names home Cats allowed to continue this private Work. */
-    collectiveWorkDelegationV1?: import('@cat-cafe/shared').CollectiveWorkDelegationV1;
-    collectiveAuthorizationInvalid?: true;
     /** F306 durable provider-neutral event; native wire vocabulary is never stored here. */
     semanticEvent?: ProviderSemanticEvent;
     /** F306 conversation return provenance; canonical content remains on this one Message. */
@@ -372,6 +380,8 @@ export interface StoredMessage {
       invocationId: string;
     };
     rich?: RichMessageExtra;
+    /** Outbound media owns publication until durable materialization completes. */
+    mediaPublication?: 'deferred';
     /** #1354 structured routing feedback retained from Queue payload into History. */
     routingWarnings?: readonly CatRoutingError[];
     /** Fresh source created by an owner-authorized cloud delivery retry. */
@@ -394,7 +404,7 @@ export interface StoredMessage {
       speechContent?: string;
     };
     /** Typed causal origin for cat output; freshness must never infer this from prose or timing. */
-    causal?: { kind: 'invocation_reply'; triggerMessageId: string };
+    causal?: { kind: 'invocation_reply'; triggerMessageId: string; triggerThreadId?: string };
     /** Host-admitted proactive dot request. The root message owns its reply scope. */
     dotAsk?: {
       v: 1;
@@ -512,6 +522,8 @@ export interface StoredMessage {
      *  domains/messaging/envelope.ts (PluginMessageExtra); kept structural here so the
      *  cats domain does not depend on the messaging domain. */
     pluginMessage?: {
+      /** Plugin presentation is payload data, never a second sender identity. */
+      presentation?: ConnectorSource;
       instanceId: string;
       revision: number;
       provenance: Record<string, unknown>;
@@ -749,6 +761,8 @@ export type AppendMessageInput = Omit<
    * Reusing the same token returns the original stored message.
    */
   idempotencyKey?: string;
+  /** Host-owned deferred publication only. Reserved while the draft is outside the message store. */
+  reservedId?: string;
 };
 
 /** Host-only dot requests share an owner/attempt namespace across target threads. */
@@ -945,37 +959,6 @@ export function prepareQueueLedgerSourceLifecycle(
   message: StoredMessage,
   entries: readonly QueueLedgerEntry[],
 ): LifecycleStoredMessageMetadata {
-  // Scope limits execution; it is not a grant manufactured by the Queue label.
-  // Bind it to immutable History source evidence before either store commits.
-  for (const entry of entries) {
-    if (entry.execution.executionScope && !isDeepStrictEqual(entry.from, message.from)) {
-      throw new Error('Collective Queue admission sender must match its durable source');
-    }
-    if (entry.execution.executionScope === 'collective-participation') {
-      const source = collectiveSourceIdentitySchema.safeParse(message.source?.meta?.participation);
-      if (
-        !source.success ||
-        message.source?.connector !== 'collective' ||
-        message.from?.kind !== 'external' ||
-        message.from.connectorId !== 'collective' ||
-        entry.targets.length !== 1 ||
-        entry.targets[0] !== source.data.catId
-      ) {
-        throw new Error('Collective participation Queue admission requires its exact durable source and target');
-      }
-    } else if (entry.execution.executionScope === 'collective-work') {
-      const invocation = collectiveWorkInvocationV1Schema.safeParse(message.extra?.collectiveWorkInvocationV1);
-      if (
-        !invocation.success ||
-        message.from?.kind !== 'system' ||
-        message.from.service !== 'collective-work' ||
-        message.source ||
-        message.extra?.collectiveAuthorizationInvalid
-      ) {
-        throw new Error('Collective work Queue admission requires its durable invocation receipt');
-      }
-    }
-  }
   const targetIds = entries.flatMap((entry) => entry.targets);
   const dispatchedTargets = new Set(message.lifecycle?.dispatchRefs?.map((ref) => ref.targetId) ?? []);
   if (targetIds.some((targetId) => dispatchedTargets.has(targetId))) {
@@ -1040,7 +1023,13 @@ export type AdvanceLifecycleInputDispatchResult =
   | { kind: 'applied' | 'replayed'; message: StoredMessage }
   | {
       kind: 'conflict';
-      reason: 'not_input' | 'identity_mismatch' | 'invalid_transition' | 'status_message_mismatch' | 'duplicate_target';
+      reason:
+        | 'not_input'
+        | 'identity_mismatch'
+        | 'invalid_transition'
+        | 'status_message_mismatch'
+        | 'duplicate_target'
+        | 'contended';
       message: StoredMessage;
     }
   | { kind: 'not_found' };
@@ -1788,42 +1777,6 @@ export function assertValidAppendMessageInput(msg: AppendMessageInput): void {
   if (msg.lifecycle !== undefined && !isLifecycleStoredMessageMetadata(msg.lifecycle)) {
     throw new TypeError('append() lifecycle metadata is invalid');
   }
-  const ownerAdmission = msg.extra?.collectiveOwnerAdmissionV1;
-  const workInvocation = msg.extra?.collectiveWorkInvocationV1;
-  const workDelegation = msg.extra?.collectiveWorkDelegationV1;
-  if (workDelegation !== undefined && (ownerAdmission !== undefined || workInvocation !== undefined)) {
-    throw new TypeError('Collective Work Message cannot combine Host authority and home delegation carriers');
-  }
-  if (ownerAdmission !== undefined) {
-    if (msg.from.kind !== 'user' || msg.source || msg.extra?.collectiveAuthorizationInvalid) {
-      throw new TypeError('Collective owner receipts require a Host-owned user Message');
-    }
-    collectiveOwnerAdmissionV1Schema.parse(ownerAdmission);
-  }
-  if (workInvocation !== undefined) {
-    if (
-      msg.from.kind !== 'system' ||
-      msg.from.service !== 'collective-work' ||
-      msg.source ||
-      msg.extra?.collectiveAuthorizationInvalid
-    ) {
-      throw new TypeError('Collective Work invocations require the canonical system producer');
-    }
-    collectiveWorkInvocationV1Schema.parse(workInvocation);
-  }
-  if (workDelegation !== undefined) {
-    const parsed = collectiveWorkDelegationV1Schema.parse(workDelegation);
-    if (
-      msg.from.kind !== 'agent' ||
-      msg.from.catId !== parsed.ownerCatId ||
-      msg.source ||
-      msg.origin !== 'callback' ||
-      msg.extra?.collectiveAuthorizationInvalid ||
-      JSON.stringify([...msg.mentions].sort()) !== JSON.stringify([...parsed.targetCatIds].sort())
-    ) {
-      throw new TypeError('Collective Work delegation requires an exact authenticated owner callback Message');
-    }
-  }
   const custody = msg.extra?.custodyOfferV1;
   if (custody) {
     const parsed = custodyOfferV1Schema.safeParse(custody);
@@ -1901,10 +1854,6 @@ export function mergeMessageExtra(
     evolutionPreparationSubmissionV1: _stripPreparation,
     dotAsk: _stripDotAsk,
     deliveryBoundary: _stripBoundary,
-    collectiveOwnerAdmissionV1: _stripCollectiveAdmission,
-    collectiveWorkInvocationV1: _stripCollectiveInvocation,
-    collectiveWorkDelegationV1: _stripCollectiveDelegation,
-    collectiveAuthorizationInvalid: _stripCollectiveInvalid,
     ...incomingHost
   } = incoming ?? {};
   const merged = { ...(existing ?? {}), ...incomingHost };
@@ -2248,6 +2197,10 @@ export interface IMessageStore {
     input: LifecycleAppendRecoveryInput,
     ledgerStore: QueueLedgerStore,
   ): LifecycleAppendRecoveryResult | Promise<LifecycleAppendRecoveryResult>;
+  commitLifecycleWakeCoverage(
+    input: LifecycleWakeCoverageInput,
+    ledgerStore: QueueLedgerStore,
+  ): LifecycleWakeCoverageResult | Promise<LifecycleWakeCoverageResult>;
   /**
    * F098-D: CAS transition queued → delivered at an admitted timestamp.
    * `deliveryTransitioned` is true only when this call won; false on a state no-op.
@@ -2441,6 +2394,7 @@ export function prepareLifecycleResponseTerminalMessage(
 
 export class MessageStore {
   private readonly userMentionIndex = new UserMentionIndex();
+  private readonly threadTimeline = new ThreadMessageTimelineIndex();
   private mentionCutover: number | undefined;
 
   getLastUserMentionHandling(userId: string) {
@@ -2569,6 +2523,7 @@ export class MessageStore {
 
   private pruneIdempotencyIndexForMessageIds(messageIds: readonly string[]): void {
     if (messageIds.length === 0) return;
+    for (const id of messageIds) this.threadTimeline.remove(id);
     const removedIds = new Set(messageIds);
     for (const [key, value] of this.idempotencyIndex.entries()) {
       if (removedIds.has(value)) {
@@ -2579,6 +2534,7 @@ export class MessageStore {
 
   /** Publish a bodyless processing placeholder only when its final body is durable. */
   private publishLifecycleResponse(message: StoredMessage): void {
+    this.threadTimeline.upsert(message);
     if (!this.visibilitySeq.has(message.id)) {
       this.visibilitySeqCounter = Math.max(this.visibilitySeqCounter + 1, Date.now());
       this.visibilitySeq.set(message.id, this.visibilitySeqCounter);
@@ -2717,6 +2673,7 @@ export class MessageStore {
     }
     message.lifecycle = structuredClone(lifecycle);
     if (!preservesPublishedAgent) message.deliveryStatus = 'queued';
+    this.threadTimeline.upsert(message);
     return { outcome: 'enqueued', message: { ...message }, entries: admitted.entries, deduped: false };
   }
 
@@ -2795,7 +2752,13 @@ export class MessageStore {
       }
     }
 
-    const { idempotencyKey, ...payload } = normalizedMessage;
+    const { idempotencyKey, reservedId: mediaReservedId, ...payload } = normalizedMessage;
+    if (mediaReservedId !== undefined && !/^\d{16}-\d{6,}-[0-9a-f]{8}$/.test(mediaReservedId))
+      throw new TypeError('reserved message id has invalid shape');
+    if (reservedId !== undefined && mediaReservedId !== undefined && reservedId !== mediaReservedId)
+      throw new Error('reserved message id conflict');
+    reservedId ??= mediaReservedId;
+    if (reservedId !== undefined && this.getById(reservedId)) throw new Error('reserved message id collision');
     void idempotencyKey;
     const stored: StoredMessage = {
       ...payload,
@@ -2803,6 +2766,7 @@ export class MessageStore {
       threadId,
     };
     this.messages.push(stored);
+    this.threadTimeline.upsert(stored);
     if (idempotencyIndexKey) {
       this.idempotencyIndex.set(idempotencyIndexKey, stored.id);
     }
@@ -3257,9 +3221,11 @@ export class MessageStore {
     const matches: StoredMessage[] = [];
     const isVisible = resolveThreadMessageVisibility(options, userId);
 
-    for (let i = this.messages.length - 1; i >= 0 && matches.length < n; i--) {
-      const msg = this.messages[i]!;
-      if (msg.threadId !== threadId) continue;
+    const timeline = this.messages
+      .filter((message) => message.threadId === threadId)
+      .sort((a, b) => getTimelineOrderTime(a) - getTimelineOrderTime(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (let i = timeline.length - 1; i >= 0 && matches.length < n; i--) {
+      const msg = timeline[i]!;
       if (msg.deletedAt) continue;
       if (!isVisible(msg)) continue;
       if (userId && msg.userId !== userId && !isSystemUserMessage(msg)) continue;
@@ -3476,9 +3442,11 @@ export class MessageStore {
     const matches: StoredMessage[] = [];
     const isVisible = resolveThreadMessageVisibility(options, userId);
 
-    for (let i = this.messages.length - 1; i >= 0 && matches.length < n; i--) {
-      const msg = this.messages[i]!;
-      if (msg.threadId !== threadId) continue;
+    const timeline = this.messages
+      .filter((message) => message.threadId === threadId)
+      .sort((a, b) => getTimelineOrderTime(a) - getTimelineOrderTime(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (let i = timeline.length - 1; i >= 0 && matches.length < n; i--) {
+      const msg = timeline[i]!;
       if (msg.deletedAt) continue;
       if (!isVisible(msg)) continue;
       if (userId && msg.userId !== userId && !isSystemUserMessage(msg)) continue;
@@ -3504,6 +3472,18 @@ export class MessageStore {
     options?: ThreadMessageReadOptions,
   ): BoundedThreadMessagePage {
     const rawLimit = Math.max(0, Math.floor(scanLimit));
+    const isVisible = resolveThreadMessageVisibility(options, userId);
+    const visible = (message: StoredMessage) =>
+      !message.deletedAt &&
+      isVisible(message) &&
+      (!userId || message.userId === userId || isSystemUserMessage(message));
+    if (options?.artifactProjection) {
+      const page = this.threadTimeline.readBefore(threadId, timestamp, beforeId, rawLimit);
+      return { ...page, messages: page.messages.filter(visible) };
+    }
+
+    // F148 keyword ranking consumes the bounded global memory window once.
+    // Account for every raw row, including other threads and rows past the cursor.
     const rawCandidates = rawLimit === 0 ? [] : this.messages.slice(-rawLimit);
     const candidates = rawCandidates
       .filter((message) => message.threadId === threadId)
@@ -3514,26 +3494,20 @@ export class MessageStore {
       })
       .filter((message) => {
         const effectiveTimestamp = getTimelineOrderTime(message);
-        if (effectiveTimestamp < timestamp) return true;
-        return effectiveTimestamp === timestamp && beforeId !== undefined && message.id < beforeId;
+        return (
+          effectiveTimestamp < timestamp ||
+          (effectiveTimestamp === timestamp && beforeId !== undefined && message.id < beforeId)
+        );
       });
-
-    const isVisible = resolveThreadMessageVisibility(options, userId);
-    const messages = candidates.filter((message) => {
-      if (message.deletedAt || !isVisible(message)) return false;
-      return !userId || message.userId === userId || isSystemUserMessage(message);
-    });
     const oldestCandidate = candidates.at(-1);
-    const nextCursor = oldestCandidate
-      ? { timestamp: getTimelineOrderTime(oldestCandidate), id: oldestCandidate.id }
-      : undefined;
-
     return {
-      messages: messages.reverse(),
+      messages: candidates.filter(visible).reverse(),
       scannedCount: rawCandidates.length,
       storageRoundTrips: 0,
       exhausted: rawCandidates.length >= this.messages.length,
-      ...(nextCursor ? { nextCursor } : {}),
+      ...(oldestCandidate
+        ? { nextCursor: { timestamp: getTimelineOrderTime(oldestCandidate), id: oldestCandidate.id } }
+        : {}),
     };
   }
 
@@ -3663,10 +3637,6 @@ export class MessageStore {
       evolutionPreparationSubmissionV1: _stripPreparation,
       dotAsk: _stripDotAsk,
       deliveryBoundary: _stripBoundary,
-      collectiveOwnerAdmissionV1: _stripCollectiveAdmission,
-      collectiveWorkInvocationV1: _stripCollectiveInvocation,
-      collectiveWorkDelegationV1: _stripCollectiveDelegation,
-      collectiveAuthorizationInvalid: _stripCollectiveInvalid,
       ...hostOnly
     } = extra as Record<string, unknown>;
     msg.extra = { ...msg.extra, ...hostOnly };
@@ -3878,6 +3848,7 @@ export class MessageStore {
       source.timelineOrderAt = input.failedAt;
       source.deliveredAt = input.failedAt;
       source.deliveryStatus = 'delivered';
+      this.threadTimeline.update(source);
       if (!this.visibilitySeq.has(source.id)) {
         this.visibilitySeqCounter = Math.max(this.visibilitySeqCounter + 1, Date.now());
         this.visibilitySeq.set(source.id, this.visibilitySeqCounter);
@@ -3945,6 +3916,44 @@ export class MessageStore {
     return { kind: 'applied', messages: [structuredClone(source), structuredClone(response)], entry: prepared.entry };
   }
 
+  commitLifecycleWakeCoverage(
+    input: LifecycleWakeCoverageInput,
+    ledgerStore: QueueLedgerStore,
+  ): LifecycleWakeCoverageResult {
+    if (!(ledgerStore instanceof InMemoryQueueLedgerStore))
+      throw new Error('Wake coverage requires the matching memory Queue ledger');
+    const sources = input.entries.map((entry) => this.messages.find((message) => message.id === entry.messageId));
+    const response = this.messages.find((message) => message.id === input.responseMessageId);
+    if (!response || sources.some((source) => !source)) return { kind: 'not_found' };
+    const entries = input.entries.map((entry) => ledgerStore.getNow(input.threadId, entry.entryId));
+    const prepared = prepareLifecycleWakeCoverage(sources as StoredMessage[], response, entries, input);
+    if (prepared.kind !== 'prepared') return prepared;
+    if (!prepared.replayed) {
+      ledgerStore.commitWakeCoverageNow(
+        input.threadId,
+        input.entries.map((entry) => entry.entryId),
+        entries,
+        prepared.entries,
+      );
+      for (const message of prepared.messages) {
+        const current = this.messages.find((candidate) => candidate.id === message.id)!;
+        current.lifecycle = structuredClone(message.lifecycle);
+        if (message.id === response.id) current.extra = structuredClone(message.extra);
+        else if (current.deliveryStatus === 'queued' && message.deliveryStatus === 'delivered') {
+          current.deliveryStatus = message.deliveryStatus;
+          current.deliveredAt = message.deliveredAt;
+          current.timelineOrderAt = message.timelineOrderAt;
+          this.threadTimeline.upsert(current);
+        }
+      }
+    }
+    return {
+      kind: prepared.replayed ? 'replayed' : 'applied',
+      messages: structuredClone(prepared.messages),
+      entries: prepared.entries,
+    };
+  }
+
   /**
    * F098-D: Mark a queued message as delivered (set deliveredAt timestamp).
    */
@@ -3956,6 +3965,7 @@ export class MessageStore {
     msg.timelineOrderAt = resolveDeliveryTimelineScore(msg, deliveredAt);
     msg.deliveredAt = deliveredAt;
     msg.deliveryStatus = 'delivered';
+    this.threadTimeline.upsert(msg);
     // #1269: Preserve existing visibility position for already-published speech.
     // Timeline-published queued cat speech gets visibilitySeq at append — delivery
     // must NOT reallocate or it would move the message after later arrivals and
@@ -3977,6 +3987,7 @@ export class MessageStore {
     if (msg.deliveryStatus === 'queued') return { kind: 'existing', message: { ...msg } };
     if (msg.deliveryStatus !== undefined) return { kind: 'conflict' };
     msg.deliveryStatus = 'queued';
+    this.threadTimeline.upsert(msg);
     return { kind: 'prepared', message: { ...msg } };
   }
 
@@ -4037,10 +4048,11 @@ export async function hydrateReplyPreview(store: IMessageStore, replyToId: strin
 
   const truncated =
     parent.content.length > PREVIEW_MAX_LENGTH ? parent.content.slice(0, PREVIEW_MAX_LENGTH) : parent.content;
+  const source = storedMessageSource(parent);
 
   return {
     from: messageFrom(parent),
-    ...(parent.source ? { source: structuredClone(parent.source) } : {}),
+    ...(source ? { source: structuredClone(source) } : {}),
     senderCatId: parent.catId,
     content: truncated,
     ...(parent.extra?.scheduler?.hiddenTrigger ? { kind: 'scheduler_trigger' as const } : {}),

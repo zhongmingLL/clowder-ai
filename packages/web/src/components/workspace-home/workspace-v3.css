@@ -49,32 +49,7 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
-.v2-works-grid .home-work-paper {
-  height: 110px;
-  margin: 12px;
-  padding: 10px;
-  overflow: hidden;
-  background: var(--shell-paper);
-}
-.v2-works-grid .home-work-kind {
-  min-height: 120px;
-}
-.v2-works-grid .home-work-label,
-.v2-works-grid .home-work-meta {
-  overflow-wrap: anywhere;
-}
-.v2-works-group {
-  padding: 10px 0;
-  font-weight: 600;
-  font-size: var(--console-font-xs);
-}
-.v2-works-source {
-  display: block;
-  padding: 5px 2px;
-  font-size: var(--console-font-label);
-  color: var(--shell-muted);
-}
-@container (max-width: 300px) {
+@container (max-width: 359px) {
   .v2-works-grid {
     grid-template-columns: minmax(0, 1fr);
   }

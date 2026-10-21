@@ -14,7 +14,11 @@ import { ToastContainer } from '@/components/ToastContainer';
 import { ConfirmProvider } from '@/components/useConfirm';
 import { META_THEME_COLOR } from '@/lib/color-defaults';
 import { buildPwaRetirementScript } from '@/lib/pwa-retirement-script';
+import { runtimeApiOriginFromPort } from '@/lib/runtime-api-origin';
 import './globals.css';
+
+// The document must carry this process's API port, never a statically baked build port.
+export const dynamic = 'force-dynamic';
 
 export const viewport: Viewport = {
   width: 'device-width',
@@ -56,6 +60,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       data-cat-cafe-build-revision={embeddedBrowserBuildRevision}
       data-cat-cafe-pwa-retirement={pwaEnabled ? 'enabled' : 'disabled'}
       data-pwa-cleanup-state={pwaEnabled ? 'enabled' : 'pending'}
+      data-cat-cafe-api-origin={runtimeApiOriginFromPort(process.env.API_SERVER_PORT)}
     >
       <head>
         <link rel="stylesheet" href="/vendor/app/theme-tokens.css" />
@@ -67,7 +72,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link rel="stylesheet" href="/vendor/app/console-shell.css" />
         <link rel="stylesheet" href="/vendor/app/console-controls.css" />
         <link rel="stylesheet" href="/vendor/app/shell-v2.css" />
-        <link rel="stylesheet" href="/vendor/app/werewolf-theme.css" />
         <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
       </head>
       <body className="min-h-screen">

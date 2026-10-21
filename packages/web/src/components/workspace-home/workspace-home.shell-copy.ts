@@ -313,11 +313,22 @@ export const homeCopy = defineShellCopy(
   {
     samples: {
       'live.scope': [[1], [12]],
+      'live.partialScope': [[0], [1], [12]],
+      'live.projectCount': [[1], [12]],
+      'live.projectRunning': [
+        [1, '1:05'],
+        [12, '23:40'],
+      ],
+      'live.confirmedCount': [[0], [1], [12]],
+      'live.projectLabel': [
+        ['cat-planet', 4, true],
+        ['cat-cafe', 1, false],
+      ],
       'live.background': [['Full check'], ['Tests']],
       'wait.scope': [[1], [7]],
       'wait.projectCount': [[1], [4]],
       'wait.updateCount': [[1], [14]],
-      'wait.longest': [['23 hours']],
+      'wait.longest': [['1 minute'], ['23 hours']],
       'wait.projectLabel': [
         ['cat-planet', 4, true],
         ['cat-cafe', 1, false],

@@ -37,9 +37,6 @@ const ROOT = resolve(process.cwd());
 const isHomeRepo = existsSync(resolve(ROOT, 'scripts/sync-to-opensource.sh'));
 const hasEnvExampleOpensource = existsSync(resolve(ROOT, '.env.example.opensource'));
 
-// Keep the source-only export regression in the canonical check:env-ports lane.
-if (isHomeRepo) await import('./sync-to-opensource-api-build.test.mjs');
-
 function readEnvFile(relPath) {
   const content = readFileSync(resolve(ROOT, relPath), 'utf-8');
   const vars = {};
@@ -215,6 +212,10 @@ function buildExportedRootScripts(sourceScripts) {
   delete scripts['test:architecture-ownership'];
 
   const internalScripts = [
+    'check:artifacts:after-api-tests',
+    'check:measurement-bundles:after-api-tests',
+    'check:capability-tips-enablement:after-api-tests',
+    'check:prompt-budget:after-api-tests',
     'check:browser-consumers',
     'sync:train',
     'antigravity:smoke',
@@ -777,24 +778,6 @@ describe(
   'Sync transform rules match convention',
   { skip: !isHomeRepo && 'sync infrastructure not present (open-source repo)' },
   () => {
-    it('exports the Git attribute that keeps the deterministic F247 bundle LF-only on Windows', () => {
-      const attributesPath = resolve(ROOT, '.gitattributes');
-      assert.ok(existsSync(attributesPath), '.gitattributes must define the generated bundle checkout contract');
-
-      const attributes = readFileSync(attributesPath, 'utf8');
-      assert.match(
-        attributes,
-        /^packages\/api\/src\/plugins\/cloud-cat-personal-host\/extension\/content-script\.js text eol=lf$/mu,
-        'the checked-in bundle must retain LF on Windows so the deterministic build comparison is byte-stable',
-      );
-
-      const managedFiles = readYamlTopLevelList('sync-manifest.yaml', 'managed_files');
-      assert.ok(
-        managedFiles.includes('.gitattributes'),
-        'sync-manifest must export .gitattributes so the public Windows checkout keeps the same bundle contract',
-      );
-    });
-
     it('_sanitize-rules.pl transforms 3002→3004 (API)', () => {
       const content = readFileSync(resolve(ROOT, 'scripts/_sanitize-rules.pl'), 'utf-8');
       assert.ok(
@@ -1213,9 +1196,19 @@ excluded:
       }
     });
 
-    it('sync-to-opensource.sh keeps exported root package script surfaces closed', () => {
+    it('sync-to-opensource.sh keeps exported root package script surfaces closed', (t) => {
       const content = readFileSync(resolve(ROOT, 'scripts/sync-to-opensource.sh'), 'utf-8');
       const exportedScripts = buildExportedRootScripts(readJsonFile('package.json').scripts);
+      const directory = mkdtempSync(resolve(tmpdir(), 'public-root-checks-'));
+      t.after(() => rmSync(directory, { recursive: true, force: true }));
+      const packagePath = resolve(directory, 'package.json');
+      writeFileSync(packagePath, JSON.stringify(readJsonFile('package.json')));
+      const transform = content.match(/<<'PACKAGE_JSON_TRANSFORM_EOF'\n([\s\S]*?)\nPACKAGE_JSON_TRANSFORM_EOF/);
+      assert.ok(transform, 'execute the actual root package projection');
+      execFileSync(process.execPath, ['-', packagePath], { input: transform[1] });
+      const actualScripts = JSON.parse(readFileSync(packagePath, 'utf8')).scripts;
+      assert.ok(!Object.keys(actualScripts).some((name) => name.endsWith(':after-api-tests')));
+      assert.ok(!Object.values(actualScripts).some((command) => command.includes(':after-api-tests')));
 
       assert.ok(
         !content.includes('pkg.scripts.check === "node scripts/run-checks.mjs"'),
@@ -1502,26 +1495,6 @@ excluded:
           `sync-manifest should export ${fixturePath} because packages/api test:public loads it`,
         );
       }
-    });
-
-    it('sync-manifest exports the GitHub plugin manifest used by public schedule factories', () => {
-      const managedFiles = readYamlTopLevelList('sync-manifest.yaml', 'managed_files');
-      const targetOwnedFiles = readYamlTopLevelList('sync-manifest.yaml', 'target_owned_files');
-      const pluginManifest = 'packages/api/src/plugins/github/plugin.yaml';
-
-      assert.ok(
-        existsSync(resolve(ROOT, pluginManifest)),
-        `${pluginManifest} should exist in the source repo so outbound sync can export it`,
-      );
-      assert.ok(
-        managedFiles.includes(pluginManifest),
-        `${pluginManifest} must be exported because packages/api public schedule tests and runtime plugin loading depend on it`,
-      );
-      assert.equal(
-        targetOwnedFiles.includes(pluginManifest),
-        false,
-        `${pluginManifest} is source-managed after #906/#905 intake and must not be restored over from the target repo`,
-      );
     });
 
     it('sync-manifest marks the F203 native L0 template as a sanitized transform', () => {

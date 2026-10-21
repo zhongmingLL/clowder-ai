@@ -12,18 +12,24 @@ import { resolveBoundAccountRefForCat } from '../../../../../../config/cat-accou
 import type { AcpVariantConfig } from '../../../../../../config/cat-config-loader.js';
 import { resolveContextCapacity } from '../../../../../../config/context-capacity.js';
 import { resolveEffectiveOpenCodeModel } from '../../../../../../config/opencode-model.js';
+import { saveSpan } from '../../../../../../utils/member-save-diagnostics.js';
 import type { AgentRegistrationFailure } from '../../registry/AgentServiceUnavailableError.js';
 import { prepareOpenCodeAcpSpawnConfig } from '../opencode-acp-spawn-config.js';
 import { AcpAgentService } from './AcpAgentService.js';
 import { AcpClient } from './AcpClient.js';
 import { AcpHttpStreamClient } from './AcpHttpStreamClient.js';
-import { AcpProcessPool, DEFAULT_ACP_IDLE_TTL_MS, type PoolKey } from './AcpProcessPool.js';
-import { resolveAcpBootstrapArgs, resolveAcpBootstrapCommand, resolveAcpBootstrapCwd } from './acp-bootstrap-cwd.js';
+import { AcpProcessPool, DEFAULT_ACP_IDLE_TTL_MS } from './AcpProcessPool.js';
 // resolveAcpMcpServers + resolveDisabledServerIds moved to AcpAgentService.invoke()
 // for invoke-time resolution (#712 P1-1).
 import { createAcpPoolSpawnSignature } from './acp-pool-signature.js';
 import { skipAcpProfile } from './acp-registration-failure.js';
 import { tryPrepareAcpProcessEnv } from './acp-spawn-env.js';
+import {
+  type AcpBootstrapContext,
+  resolveAcpBootstrap,
+  type VerifiedAcpBootstrapContext,
+  verifyAcpBootstrap,
+} from './bootstrap/acp-bootstrap-context.js';
 
 export type AcpPoolRegistry = Map<string, AcpProcessPool>;
 
@@ -36,17 +42,10 @@ export interface CreateAcpServiceForConfigInput {
   acpConfig: AcpVariantConfig;
   poolRegistry: AcpPoolRegistry;
   log: Pick<FastifyBaseLogger, 'info' | 'warn'>;
+  /** Tests supply an owned throwaway root; production uses the platform default. */
+  bootstrapRoot?: string;
   /** Carry a safe registration failure to the router while leaving this service absent. */
   onUnavailable?: (reason: AgentRegistrationFailure) => void;
-}
-
-interface AcpBootstrapContext {
-  projectRoot: string;
-  command: string;
-  args: string[];
-  cwd: string;
-  model?: string;
-  poolKey: PoolKey;
 }
 
 interface AcpAccountContext {
@@ -85,28 +84,8 @@ function resolveAcpContextPolicy(config: CatConfig, effectiveModel: string): Acp
   };
 }
 
-function resolveAcpBootstrap(
-  projectRoot: string,
-  profileId: string,
-  acpConfig: AcpVariantConfig,
-  effectiveModel: string,
-): AcpBootstrapContext {
-  const model = effectiveModel.trim() || undefined;
-  const args = resolveAcpBootstrapArgs(projectRoot, acpConfig.startupArgs, {
-    base_model: model,
-    model,
-  });
-  return {
-    projectRoot,
-    command: resolveAcpBootstrapCommand(projectRoot, acpConfig.command),
-    args,
-    cwd: resolveAcpBootstrapCwd(projectRoot, profileId),
-    model,
-    poolKey: { projectPath: projectRoot, providerProfile: profileId },
-  };
-}
-
 function resolveAcpAccount(projectRoot: string, config: CatConfig): AcpAccountContext {
+  if (config.configurationSource === 'native_tool' && !config.accountRef) return { account: null };
   const catId = config.id;
   const accountRef = resolveBoundAccountRefForCat(projectRoot, catId, config);
   const builtinClient = resolveBuiltinClientForProvider(config.clientId);
@@ -147,7 +126,7 @@ async function prepareAcpSpawnContext(
     // kimi-code's ACP server creates sessions through the same KimiCLI.create()
     // path as the CLI. KIMI_MODEL_MAX_CONTEXT_SIZE is its supported model-window
     // override, so keep the member policy process-scoped instead of mutating the
-    // user's shared ~/.kimi/config.toml.
+    // user's shared ~/.kimi-code/config.toml.
     acpSpawnEnv = {
       ...(acpSpawnEnv ?? {}),
       KIMI_MODEL_MAX_CONTEXT_SIZE: String(contextPolicy.windowTokens),
@@ -196,7 +175,7 @@ async function prepareAcpSpawnContext(
 
 async function ensureAcpPool(
   input: CreateAcpServiceForConfigInput,
-  bootstrap: AcpBootstrapContext,
+  bootstrap: VerifiedAcpBootstrapContext,
   spawn: AcpSpawnContext,
 ): Promise<AcpProcessPool> {
   const { profileId, acpConfig, poolRegistry } = input;
@@ -204,6 +183,7 @@ async function ensureAcpPool(
     command: bootstrap.command,
     args: bootstrap.args,
     cwd: bootstrap.cwd,
+    bootstrapIsolation: bootstrap.isolation,
     env: spawn.env ?? null,
     openCodeRuntimeConfig: spawn.openCodeRuntimeConfig,
     contextPolicy: spawn.contextPolicy,
@@ -233,7 +213,10 @@ async function ensureAcpPool(
       const clientCfg = {
         command: bootstrap.command,
         args: bootstrap.args,
-        cwd: bootstrap.cwd,
+        // Cold starts must recreate a lost cwd and revalidate its permissions.
+        // Existing live processes keep their cwd and drain under pool policy.
+        cwd: bootstrap.verifyCwd(),
+        ...(process.platform === 'win32' ? { verifyBootstrapCwd: bootstrap.verifyCwd } : {}),
         ...(spawn.env ? { env: spawn.env } : {}),
       };
       return acpConfig.transport === 'httpstream' ? new AcpHttpStreamClient(clientCfg) : new AcpClient(clientCfg);
@@ -297,9 +280,10 @@ export async function createAcpServiceForConfig(
       );
     }
   }
-  const spawn = await prepareAcpSpawnContext(effectiveInput, bootstrap, accountContext);
+  const spawn = await saveSpan('acp.prepare', () => prepareAcpSpawnContext(effectiveInput, bootstrap, accountContext));
   if (!spawn) return null;
-  const pool = await ensureAcpPool(effectiveInput, bootstrap, spawn);
+  const verified = verifyAcpBootstrap(bootstrap, profileId, input.bootstrapRoot, spawn.env);
+  const pool = await saveSpan('acp.pool', () => ensureAcpPool(effectiveInput, verified, spawn));
 
   // #712 P1-1: pass whitelist — MCP resolution happens at invoke time in
   // AcpAgentService so capability toggles take effect without registry rebuild.

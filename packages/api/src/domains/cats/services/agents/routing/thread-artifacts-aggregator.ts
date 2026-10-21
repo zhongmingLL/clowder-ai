@@ -167,9 +167,11 @@ function visitBlockArtifacts(b: RichBlock, msg: AggregatorMessage, visit: Artifa
       });
       return;
     case 'html_widget':
-      visit({ ...base, type: 'widget', name: b.title ?? 'Widget' });
+      // 只带定位，不带 HTML 正文：面板按坐标回原消息读取，并在读取时复核 kind。
+      visit({ ...base, type: 'widget', name: b.title ?? 'Widget', widgetBlockId: b.id });
       return;
     case 'interactive':
+      // interactive 是审批/选择控件，仍回原消息处理；不给块坐标，避免被当成 HTML 预览。
       visit({ ...base, type: 'widget', name: b.title ?? b.description ?? 'Interactive' });
       return;
     default:
@@ -205,6 +207,17 @@ export function projectMessageArtifacts(messages: readonly AggregatorMessage[]):
   const out: ThreadArtifactDTO[] = [];
   visitMessageArtifacts(messages, (artifact) => out.push(artifact));
   return out;
+}
+
+/** A single gallery cannot make one catalogue response or one F309 lookup unbounded. */
+export function projectMessageArtifactSlice(message: AggregatorMessage, offset: number, limit: number) {
+  const artifacts: ThreadArtifactDTO[] = [];
+  let total = 0;
+  visitMessageArtifacts([message], (artifact) => {
+    if (total >= offset && artifacts.length < limit) artifacts.push(artifact);
+    total += 1;
+  });
+  return { artifacts, total };
 }
 
 const RECENT_MESSAGE_ARTIFACT_TYPES = new Set<ThreadArtifactDTO['type']>(['image', 'video', 'file']);

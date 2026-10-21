@@ -63,6 +63,7 @@ import {
   registerCallbackAuthHook,
 } from './callback-auth-prehandler.js';
 import { resolvePrincipalThread } from './callback-scope-helpers.js';
+import { registerWorkspaceVideoFileActions } from './local-video-file-actions.js';
 import { parseWorkspaceChangedFiles } from './workspace-diff.js';
 import { workspaceDirectHuman } from './workspace-direct-human.js';
 import { registerWorkspaceFileSourceRoutes } from './workspace-file-source-routes.js';
@@ -266,7 +267,7 @@ async function searchWorkspaceContent(
 
 /** The tree listing's own visibility rule: dot entries (except .claude/.kimi) and SKIP_DIRS are not shown. */
 function hiddenFromTree(name: string): boolean {
-  return (name.startsWith('.') && name !== '.claude' && name !== '.kimi') || SKIP_DIRS.has(name);
+  return (name.startsWith('.') && name !== '.claude' && name !== '.kimi-code') || SKIP_DIRS.has(name);
 }
 
 async function buildTree(root: string, dirPath: string, depth: number, maxDepth: number): Promise<TreeNode[]> {
@@ -418,6 +419,7 @@ async function attachSkillConsumptionReceipt(
 }
 
 export const workspaceRoutes: FastifyPluginAsync<WorkspaceRouteOpts> = async (app, opts) => {
+  registerWorkspaceVideoFileActions(app);
   const auditLog = opts.auditLog ?? getEventAuditLog();
   if (opts.callbackRegistry) {
     registerCallbackAuthHook(app, opts.callbackRegistry, { agentKeyRegistry: opts.agentKeyRegistry });
@@ -679,9 +681,9 @@ export const workspaceRoutes: FastifyPluginAsync<WorkspaceRouteOpts> = async (ap
     }
   });
 
-  // GET /api/workspace/diff?worktreeId=&path= — git diff (all changed files or single file)
+  // GET /api/workspace/diff?worktreeId=&path=&view=files — file list or full patch
   app.get<{
-    Querystring: { worktreeId?: string; path?: string };
+    Querystring: { worktreeId?: string; path?: string; view?: 'files' };
   }>('/api/workspace/diff', async (request, reply) => {
     const { worktreeId, path: filePath } = request.query;
     if (!worktreeId) {
@@ -708,6 +710,9 @@ export const workspaceRoutes: FastifyPluginAsync<WorkspaceRouteOpts> = async (ap
         if (!allowedPaths.includes(filePath)) {
           return { worktreeId, changedFiles, diff: '' };
         }
+      }
+      if (request.query.view === 'files') {
+        return { worktreeId, changedFiles, diff: '' };
       }
       const pathspec = filePath ? [filePath] : allowedPaths;
 

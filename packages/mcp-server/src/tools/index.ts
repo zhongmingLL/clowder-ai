@@ -61,7 +61,6 @@ export {
   handleOfferCustody,
   handlePostMessage,
   handleRecordMemoryCueOutcome,
-  handleRegisterPrTracking,
   handleRetryCustodyAdmission,
   handleUpdateEntrustedWork,
   handleUpdateTask,
@@ -69,7 +68,6 @@ export {
   listThreadsInputSchema,
   offerCustodyInputSchema,
   postMessageInputSchema,
-  registerPrTrackingInputSchema,
   retryCustodyAdmissionInputSchema,
   updateEntrustedWorkInputSchema,
   updateTaskInputSchema,
@@ -105,12 +103,6 @@ export {
   startEvolutionProgramInputSchema,
   updateEvolutionProgramInputSchema,
 } from './capability-evolution-tools.js';
-export { collectiveParticipationTools } from './collective-participation-tools.js';
-export {
-  communityRouteAcceptanceInputSchema,
-  communityRouteAcceptanceTools,
-  handleCommunityRouteAcceptance,
-} from './community-route-acceptance-tool.js';
 export {
   contentEditorTools,
   editOfficeDocumentInputSchema,
@@ -161,11 +153,6 @@ export {
   searchEvidenceInputSchema,
 } from './evidence-tools.js';
 export {
-  externalReviewVerdictInputSchema,
-  externalReviewVerdictTools,
-  handleExternalReviewVerdict,
-} from './external-review-verdict-tool.js';
-export {
   externalRuntimeSessionCallbackTools,
   externalRuntimeSessionReadTools,
   externalRuntimeSessionTools,
@@ -187,11 +174,6 @@ export {
   financeTools,
   handleFinanceQuery,
 } from './finance-tools.js';
-export {
-  gameActionTools,
-  handleSubmitGameAction,
-  submitGameActionInputSchema,
-} from './game-action-tools.js';
 export {
   graphResolveInputSchema,
   graphTools,
@@ -236,11 +218,6 @@ export {
   limbListToolsInputSchema,
   limbTools,
 } from './limb-tools.js';
-export {
-  handleReadMeetingArtifact,
-  meetingArtifactTools,
-  readMeetingArtifactInputSchema,
-} from './meeting-artifact-tools.js';
 export {
   createMemoryCueTools,
   drillMemoryCueInputSchema,

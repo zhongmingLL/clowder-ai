@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { resolve } from 'node:path';
 import { test } from 'node:test';
 import { createCatId } from '@cat-cafe/shared';
 import { CLI_EXECUTION_ID_ENV, CLI_EXECUTION_OWNER_BINDING_ENV } from '../src/utils/cli-process-ownership.js';
@@ -84,6 +85,7 @@ test('launch preserves resume, account isolation, native identity and managed F2
     },
   });
   assert.equal(prepared.sdkOptions.resume, 'prior-session');
+  assert.equal(prepared.sdkOptions.env?.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1');
   assert.equal(prepared.sdkOptions.env?.ANTHROPIC_API_KEY, undefined);
   assert.equal(prepared.sdkOptions.env?.ANTHROPIC_BASE_URL, undefined);
   assert.equal(prepared.sdkOptions.env?.SOME_ACCOUNT_SETTING, 'kept');
@@ -189,9 +191,13 @@ test('SDK retains repeated operator directories together with image directories'
       options: { ...options, ...(readOnly ? { toolExecutionPolicy: { mode: 'read_only' as const } } : {}) },
     });
   const prepared = await prepare();
-  assert.deepEqual(prepared.sdkOptions.additionalDirectories, ['/tmp/first', '/tmp/second with spaces', '/tmp/images']);
+  assert.deepEqual(prepared.sdkOptions.additionalDirectories, [
+    '/tmp/first',
+    '/tmp/second with spaces',
+    resolve('/tmp/images'),
+  ]);
   assert.equal(prepared.sdkOptions.extraArgs?.['add-dir'], undefined);
-  assert.deepEqual((await prepare(true)).sdkOptions.additionalDirectories, ['/tmp/images']);
+  assert.deepEqual((await prepare(true)).sdkOptions.additionalDirectories, [resolve('/tmp/images')]);
 });
 
 test('production invocation keeps native SDK query with tmux enabled and preserves CLI overrides', async (t) => {
@@ -241,6 +247,7 @@ test('production invocation keeps native SDK query with tmux enabled and preserv
           user_message_uuids: [first?.uuid],
           usage: { input_tokens: 1, output_tokens: 1 },
         };
+        yield { type: 'system', subtype: 'session_state_changed', state: 'idle' };
       },
     }),
   });

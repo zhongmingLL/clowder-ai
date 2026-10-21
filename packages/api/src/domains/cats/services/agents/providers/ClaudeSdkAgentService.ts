@@ -1,10 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
-import {
-  type Options as ClaudeSdkOptions,
-  query as claudeQuery,
-  type SDKUserMessage,
-} from '@anthropic-ai/claude-agent-sdk';
+import type { Options as ClaudeSdkOptions, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { type CatId, createCatId } from '@cat-cafe/shared';
 import { getCatModel } from '../../../../../config/cat-models.js';
 import { redactClaudeLaunchToken } from '../../../../../config/claude-token-account.js';
@@ -25,6 +21,7 @@ import { resolveDefaultClaudeMcpServerPath } from './ClaudeAgentService.js';
 import { extractClaudeUsage, transformClaudeEvent } from './claude-ndjson-parser.js';
 import { sdkCompactionHooks } from './claude-sdk-compaction-hooks.js';
 import { prepareClaudeSdkLaunch } from './claude-sdk-launch.js';
+import { loadClaudeSdkQuery } from './claude-sdk-query.js';
 import { withActiveRunControlDeadline } from './claude-sdk-runtime-helpers.js';
 import { ClaudeSdkTurnInputState, createSdkUserMessage } from './claude-sdk-turn-input-state.js';
 import { type RawArchiveSink, sanitizeRawEvent } from './codex-audit-hooks.js';
@@ -86,7 +83,7 @@ export class ClaudeSdkAgentService implements AgentService {
   private readonly model: string;
   private readonly mcpServerPath: string | undefined;
   private readonly l0CompilerFn: typeof compileL0ViaSubprocess;
-  private readonly queryFn: ClaudeSdkQueryFn;
+  private readonly queryFn: ClaudeSdkQueryFn | undefined;
   private readonly rawArchive: RawArchiveSink;
   private readonly activeRunControlTimeoutMs: number;
 
@@ -94,7 +91,7 @@ export class ClaudeSdkAgentService implements AgentService {
     this.catId = options?.catId ?? createCatId('opus');
     this.model = options?.model ?? getCatModel(this.catId as string);
     this.l0CompilerFn = options?.l0CompilerFn ?? compileL0ViaSubprocess;
-    this.queryFn = options?.queryFn ?? claudeQuery;
+    this.queryFn = options?.queryFn;
     this.rawArchive = options?.rawArchive ?? new CliRawArchive();
     this.activeRunControlTimeoutMs = options?.activeRunControlTimeoutMs ?? DEFAULT_ACTIVE_RUN_CONTROL_TIMEOUT_MS;
     const configuredPath = options?.mcpServerPath ?? process.env.CAT_CAFE_MCP_SERVER_PATH;
@@ -241,7 +238,8 @@ export class ClaudeSdkAgentService implements AgentService {
         abortController,
         options,
       });
-      if (abortController.signal.aborted) {
+      const queryFn = this.queryFn ?? (await loadClaudeSdkQuery(abortController.signal));
+      if (!queryFn || abortController.signal.aborted) {
         yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
         return;
       }
@@ -251,7 +249,7 @@ export class ClaudeSdkAgentService implements AgentService {
       sdkOptions.stderr = (data) => {
         stderrBuffer = sanitizeCliStderr(`${stderrBuffer}${data}`).slice(-MAX_SDK_STDERR_CHARS);
       };
-      query = this.queryFn({ prompt: turnInputs.input, options: sdkOptions });
+      query = queryFn({ prompt: turnInputs.input, options: sdkOptions });
       turnInputs.push(createSdkUserMessage(prepared.prompt, activeSessionId, initialMessageId));
       archive({ type: 'sdk_input', kind: 'primary', uuid: initialMessageId });
       for await (const rawEvent of query) {
@@ -278,6 +276,7 @@ export class ClaudeSdkAgentService implements AgentService {
         // The archive is ordered best-effort diagnostics, not the receipt
         // authority. Disk I/O must not delay cancellation or member output.
         archive(event);
+        turnInputs.observeSessionState(raw);
         const isResultTerminal = raw.type === 'result';
         if (typeof raw.session_id === 'string' && raw.session_id) {
           activeSessionId = raw.session_id;
@@ -323,10 +322,10 @@ export class ClaudeSdkAgentService implements AgentService {
           }
         }
         // A streaming-input query may carry multiple accepted turns. Close at
-        // the result for the final accepted input, but keep consuming when an
-        // Append/Steer already promised another result to the caller. Breaking
+        // native idle only after accepted inputs and background report turns
+        // have drained. A result alone can precede queued reports. Breaking
         // performs AsyncIteratorClose (Query.return), terminating the SDK query.
-        if (isResultTerminal && !turnInputs.isAccepting) break;
+        if (!turnInputs.isAccepting) break;
       }
       if ((!terminal || turnInputs.isAccepting) && !abortController.signal.aborted)
         throw new Error('claude_sdk_stream_ended_without_result');

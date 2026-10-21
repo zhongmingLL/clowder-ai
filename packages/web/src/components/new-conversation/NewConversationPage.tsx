@@ -3,18 +3,24 @@
 import type { GlobalArtifactDTO } from '@cat-cafe/shared';
 import Image from 'next/image';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCatData } from '@/hooks/useCatData';
 import { useChatStore } from '@/stores/chatStore';
 import { useSidebarProjectionStore } from '@/stores/sidebarProjectionStore';
+import { scrollToMessage } from '@/utils/scrollToMessage';
+import { kickTeleportResolve, planTeleport } from '@/utils/teleport';
 import { AppTooltip } from '../AppTooltip';
 import { ChatInput } from '../ChatInput';
+import { buildCatOptions } from '../chat-input-options';
 import { useArtworkLightboxScope } from '../content-review/ArtworkLightboxScope';
 import { useArtifactLightbox } from '../content-review/useArtifactLightbox';
+import { DemoEntryActions } from '../onboarding-demo/DemoEntryActions';
 import { ShellGlyph } from '../shell/ShellIcons';
 import { useShellCopy } from '../shell/shell-copy';
 import { getProjectPaths } from '../ThreadSidebar/thread-utils';
 import { ThreadComposerHost } from '../thread-chat/ThreadComposerHost';
 import { NewConversationComposerContext } from './NewConversationComposerContext';
 import { newConversationCopy } from './new-conversation.shell-copy';
+import { queueWorkDiscussion } from './queue-work-discussion';
 import { RecentWorks } from './RecentWorks';
 import { SessionImportPanel } from './SessionImportPanel';
 import { useNewConversationAdmission } from './useNewConversationAdmission';
@@ -163,10 +169,13 @@ export interface NewConversationPageProps {
   onToggleSidebar: () => void;
   onToggleStatusPanel: () => void;
   onNavigate: (threadId: string) => void;
+  onShowCollaboration?: () => void;
 }
 
 export function NewConversationPage(props: NewConversationPageProps) {
   const copy = useShellCopy(newConversationCopy);
+  const { cats } = useCatData();
+  const [discussionNotice, setDiscussionNotice] = useState<string | null>(null);
   const floating = useArtifactLightbox('default');
   const floatingScope = useArtworkLightboxScope();
   const admission = useNewConversationAdmission(props.onNavigate);
@@ -183,6 +192,35 @@ export function NewConversationPage(props: NewConversationPageProps) {
     },
     [openPublishedArtifact, floating.open],
   );
+  const discussWork = (artifact: GlobalArtifactDTO) => {
+    const messageId = artifact.sourceMessageId;
+    if (!messageId) {
+      setDiscussionNotice(copy.discussionFailed);
+      return;
+    }
+    const cat = buildCatOptions(cats).find((item) => item.id === artifact.catId && !item.isGroup);
+    if (
+      !cat ||
+      !queueWorkDiscussion(artifact, cat.insert, { title: copy.worksFailed, message: copy.discussionDraftFailed })
+    ) {
+      setDiscussionNotice(copy.discussionFailed);
+      return;
+    }
+    setDiscussionNotice(null);
+    const plan = planTeleport({
+      threadId: artifact.threadId,
+      messageId,
+      currentThreadId: useChatStore.getState().currentThreadId,
+    });
+    // Restore the target first: closing the landing panel would leave its saved Works pane covering Chat.
+    useChatStore.getState().setCurrentThread(artifact.threadId);
+    useChatStore.getState().closeRightPanel();
+    if (plan.navigateTo) props.onNavigate(plan.navigateTo);
+    else if (plan.scrollNow) {
+      scrollToMessage(plan.scrollNow);
+      kickTeleportResolve();
+    }
+  };
   const busy = admission.phase === 'creating' || admission.phase === 'sending';
   const titleBreak = copy.heroTitle.indexOf('，');
 
@@ -296,9 +334,11 @@ export function NewConversationPage(props: NewConversationPageProps) {
           localSaveFailed={admission.localSaveFailed}
           onRetry={admission.retryLoad}
         />
+        {props.onShowCollaboration && <DemoEntryActions onShowCollaboration={props.onShowCollaboration} />}
         {floating.error && <p role="alert">{floating.error}</p>}
         <div className="mt-8">
-          <RecentWorks onOpen={openWork} onOpenAll={() => setWorkspaceMode('artifacts')} />
+          <RecentWorks onOpen={openWork} onOpenAll={() => setWorkspaceMode('artifacts')} onDiscuss={discussWork} />
+          {discussionNotice && <p role="alert">{discussionNotice}</p>}
         </div>
       </div>
     </main>

@@ -39,6 +39,7 @@ import {
 } from './AcpClient.js';
 import { AcpCwdIdentityTracker } from './acp-cwd-identity.js';
 import { type AcpPromptInput, toAcpPromptContent } from './acp-prompt-content.js';
+import { AcpSessionBindingError, ActiveSessionCache } from './active-session-cache.js';
 import type {
   AcpAgentRequest,
   AcpInitializeResult,
@@ -81,6 +82,7 @@ interface AgentResponseOptions {
 // ─── Client ──────────────────────────────────────────────────
 
 export class AcpHttpStreamClient {
+  private readonly liveSessions = new ActiveSessionCache();
   private child: ChildProcess | null = null;
   private closed = false;
   private exited = false;
@@ -104,6 +106,7 @@ export class AcpHttpStreamClient {
   // ── Lifecycle ────────────────────────────────────────────────
 
   async initialize(): Promise<AcpInitializeResult> {
+    this.liveSessions.clear();
     // Phase 1: spawn the process
     const doSpawn = this.config.spawnFn ?? nodeSpawn;
     let command = resolveCliCommandOrBare(this.config.command);
@@ -116,12 +119,11 @@ export class AcpHttpStreamClient {
     // #712: Re-create bootstrap CWD if cleaned up by OS temp-dir rotation or agent exit.
     // Skip when a test spawnFn is injected — the directory may be a fake path
     // (e.g. '/my/project') that can't be created on CI runners.
-    if (!this.config.spawnFn) {
+    if (!this.config.spawnFn && !(IS_WINDOWS && this.config.verifyBootstrapCwd)) {
       mkdirSync(this.config.cwd, { recursive: true, mode: 0o700 });
     }
     // #1203: Capture the cwd's directory identity at spawn so isCwdIntact can
     // detect delete→recreate at the same path, not just deletion.
-    this.cwdIdentityTracker.capture();
 
     const spawnOpts: SpawnOptions & { stdio: ['pipe', 'pipe', 'pipe'] } = {
       cwd: this.config.cwd,
@@ -147,6 +149,8 @@ export class AcpHttpStreamClient {
       spawnOpts.env = supervised.env;
     }
 
+    if (IS_WINDOWS && !this.config.spawnFn) this.config.verifyBootstrapCwd?.(command, args, childEnv);
+    this.cwdIdentityTracker.capture();
     this.child = doSpawn(command, args, spawnOpts) as ChildProcess;
 
     // Stderr: capacity detection (shared with stdio client)
@@ -212,7 +216,7 @@ export class AcpHttpStreamClient {
     const t0 = Date.now();
     const resp = await this.httpRequest(ACP_METHODS.sessionNew, { cwd: effectiveCwd, mcpServers: compatible });
     log.info({ durationMs: Date.now() - t0, hasResult: !!resp.result }, 'ACP HTTP session/new: response');
-    return resp.result as unknown as AcpNewSessionResult;
+    return this.liveSessions.remember(resp.result as unknown as AcpNewSessionResult, effectiveCwd, compatible);
   }
 
   async loadSession(sessionId: string, cwd?: string, mcpServers: AcpMcpServer[] = []): Promise<AcpNewSessionResult> {
@@ -223,22 +227,57 @@ export class AcpHttpStreamClient {
       'ACP HTTP session/load',
     );
     const t0 = Date.now();
-    const resp = await this.httpRequest(ACP_METHODS.sessionLoad, {
+    const method =
+      !this.initResult?.agentCapabilities?.loadSession &&
+      this.initResult?.agentCapabilities?.sessionCapabilities?.resume
+        ? ACP_METHODS.sessionResume
+        : ACP_METHODS.sessionLoad;
+    if (!this.initResult?.agentCapabilities?.loadSession) {
+      const active = this.liveSessions.get(
+        sessionId,
+        effectiveCwd,
+        compatible,
+        !this.closed && !this.exited && !this.unquiescedSessionIds.has(sessionId),
+      );
+      if (active) return active;
+      if (this.initResult && !this.initResult.agentCapabilities?.sessionCapabilities?.resume)
+        throw new AcpSessionBindingError('ACP 工具未声明会话恢复能力，原历史已保留。');
+    }
+    const resp = await this.httpRequest(method, {
       sessionId,
       cwd: effectiveCwd,
       mcpServers: compatible,
     });
     log.info({ sessionId, durationMs: Date.now() - t0, hasResult: !!resp.result }, 'ACP HTTP session/load: response');
-    return resp.result as unknown as AcpNewSessionResult;
+    return this.liveSessions.remember(
+      {
+        ...resp.result,
+        sessionId: typeof resp.result?.sessionId === 'string' ? resp.result.sessionId : sessionId,
+      } as AcpNewSessionResult,
+      effectiveCwd,
+      compatible,
+    );
   }
 
-  async setSessionConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
-    if (!configId.trim() || !value.trim()) return;
-    await this.httpRequest(ACP_METHODS.sessionSetConfigOption, {
+  async closeSession(sessionId: string): Promise<void> {
+    if (!this.initResult?.agentCapabilities?.sessionCapabilities?.close) return;
+    await this.httpRequest(ACP_METHODS.sessionClose, { sessionId });
+    this.liveSessions.forget(sessionId);
+  }
+
+  async setSessionConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    if (!configId.trim()) return;
+    const response = await this.httpRequest(ACP_METHODS.sessionSetConfigOption, {
       sessionId,
       configId: configId.trim(),
-      value: value.trim(),
+      value,
     });
+    this.liveSessions.update(sessionId, response.result);
+    return response.result;
   }
 
   /**
@@ -322,6 +361,7 @@ export class AcpHttpStreamClient {
     };
 
     const enqueueSessionUpdate = (params: AcpSessionUpdate | Record<string, unknown>) => {
+      this.liveSessions.notify(params);
       if (params.sessionId !== sessionId) return;
 
       queue.push(params as AcpSessionUpdate);
@@ -584,6 +624,7 @@ export class AcpHttpStreamClient {
   }
 
   async close(): Promise<void> {
+    this.liveSessions.clear();
     if (this.closed) return;
     this.closed = true;
 

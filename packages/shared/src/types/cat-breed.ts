@@ -59,8 +59,12 @@ export interface CatVariant {
   readonly mentionPatterns?: readonly string[];
   /** F127: member-side binding to a concrete account config (built-in or API key). */
   readonly accountRef?: string;
+  /** Native tools own authentication and omitted model/effort defaults. */
+  readonly configurationSource?: 'native_tool' | 'managed_account';
   /** A local tool's selection, or an explicit per-member exception. */
   readonly accountBindingMode?: 'follow' | 'override';
+  /** Internal creation ownership; not part of the public member projection. */
+  readonly creationReceipt?: { readonly requestHash: string; readonly payloadHash: string };
   /** clowder-ai#340 P5: CLI client identity (renamed from `provider`). */
   readonly clientId: ClientId;
   /** Canonical member access mode. Config reads default to `cli`. */
@@ -256,6 +260,8 @@ export interface CredentialEntry {
  */
 export interface CatCafeConfigV1 {
   readonly version: 1;
+  /** Persisted enrollment policy; retain it when parsing or writing a catalog. */
+  readonly memberInitialization?: string;
   readonly breeds: readonly CatBreed[];
   readonly selectedAccountRefs?: Readonly<Record<string, string>>;
 }
@@ -283,6 +289,8 @@ export interface CoCreatorConfig {
  */
 export interface CatCafeConfigV2 {
   readonly version: 2;
+  /** Persisted enrollment policy; retain it when parsing or writing a catalog. */
+  readonly memberInitialization?: string;
   readonly breeds: readonly CatBreed[];
   readonly selectedAccountRefs?: Readonly<Record<string, string>>;
   readonly roster: Roster;

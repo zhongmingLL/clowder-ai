@@ -65,7 +65,7 @@ export interface ParticipationView {
     delivery: string;
     failure?: { code: string };
     privateThread?: { id: string; title?: string };
-    execution?: { stage: 'queued' | 'started' | 'ended' | 'failed' };
+    execution?: { stage: 'queued' | 'started' | 'ended' | 'failed'; invocationId?: string };
     attention?:
       | { request: 'response_requested'; state: 'unclaimed' }
       | {
@@ -94,7 +94,7 @@ export function useCollectiveParticipation(connectionId: string) {
   const [notice, setNotice] = useState<string>();
   const busyRef = useRef(false);
   const readRevision = useRef(0);
-  const base = `/api/plugins/collective-connector/${encodeURIComponent(connectionId)}`;
+  const base = `/api/plugins/official.collective-connector/connections/${encodeURIComponent(connectionId)}`;
   const load = useCallback(
     async (signal?: AbortSignal) => {
       const revision = ++readRevision.current;

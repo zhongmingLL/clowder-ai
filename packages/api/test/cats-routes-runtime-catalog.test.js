@@ -144,6 +144,26 @@ function seedCatalogFromTemplate(projectRoot, templateObj) {
 }
 
 describe('cats routes read runtime catalog', { concurrency: false }, () => {
+  it('CLI login checks require a session before starting any credential-reading process', async (t) => {
+    const projectRoot = createRuntimeCatalogProject(makeCatalog('auth-probe-cat', '登录检测猫'));
+    process.env.CAT_TEMPLATE_PATH = join(projectRoot, 'cat-template.json');
+    const keys = ['HOME', 'USERPROFILE', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'DSH_HOME'];
+    const saved = new Map(keys.map((key) => [key, process.env[key]]));
+    for (const key of keys) process.env[key] = projectRoot;
+    t.after(() => {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+    const Fastify = (await import('fastify')).default;
+    const { catsRoutes } = await import('../dist/routes/cats.js');
+    const app = Fastify();
+    t.after(() => app.close());
+    await app.register(catsRoutes);
+    const res = await app.inject({ method: 'GET', url: '/api/cats/native-runtimes' });
+    assert.equal(res.statusCode, 401);
+  });
   beforeEach(() => {
     savedTemplatePath = process.env.CAT_TEMPLATE_PATH;
     savedGlobalRoot = process.env.CAT_CAFE_GLOBAL_CONFIG_ROOT;
@@ -304,7 +324,7 @@ describe('cats routes read runtime catalog', { concurrency: false }, () => {
     assert.equal(runtimeCat.roster, null);
   });
 
-  it('GET /api/cats bootstraps the runtime catalog before the first read', async () => {
+  it('GET /api/cats bootstraps an empty runtime catalog before the first read', async (t) => {
     const codexTemplate = makeCatalog('codex', 'Codex');
     const antigravityTemplate = makeCatalog('antigravity', 'Antigravity', 'antigravity', 'gemini-bridge');
     const opencodeTemplate = makeCatalog('opencode', 'OpenCode', 'opencode', 'claude-opus-4-6');
@@ -317,27 +337,29 @@ describe('cats routes read runtime catalog', { concurrency: false }, () => {
 
     const Fastify = (await import('fastify')).default;
     const { catsRoutes } = await import('../dist/routes/cats.js');
+    const { catRegistry } = await import('@cat-cafe/shared');
+    const previousCats = catRegistry.getAllConfigs();
+    catRegistry.reset();
+    t.after(() => {
+      catRegistry.reset();
+      for (const [id, config] of Object.entries(previousCats)) catRegistry.register(id, config);
+    });
 
     const app = Fastify();
+    t.after(() => app.close());
     await app.register(catsRoutes);
 
     const res = await app.inject({ method: 'GET', url: '/api/cats' });
     assert.equal(res.statusCode, 200);
     const body = JSON.parse(res.body);
-    // #948 bootstrap persists exactly one usable seed member. GET /api/cats also
-    // merges catRegistry, so unrelated globally registered cats may be present.
-    // Only the project-local seed is guaranteed on the first read.
-    const catIds = body.cats.map((cat) => cat.id);
-    assert.ok(catIds.includes('codex'), 'first read should include bootstrapped seed cat "codex"');
+    assert.deepEqual(body.cats, [], 'first read must not enroll any project template member');
 
     const runtimeCatalog = JSON.parse(readFileSync(join(projectRoot, '.cat-cafe', 'cat-catalog.json'), 'utf-8'));
-    assert.deepEqual(
-      runtimeCatalog.breeds.map((breed) => breed.catId),
-      ['codex'],
-      'bootstrap should persist only the selected seed member',
-    );
-
-    await app.close();
+    assert.deepEqual(runtimeCatalog.breeds, [], 'bootstrap must persist an empty member list');
+    assert.equal(runtimeCatalog.memberInitialization, 'user_selected_v1');
+    const nextRead = await app.inject({ method: 'GET', url: '/api/cats' });
+    assert.equal(nextRead.statusCode, 200);
+    assert.deepEqual(nextRead.json().cats, [], 'subsequent reads must not enroll template members either');
   });
 
   it('GET /api/cats falls back to the readable active project root when CAT_TEMPLATE_PATH is stale', async () => {

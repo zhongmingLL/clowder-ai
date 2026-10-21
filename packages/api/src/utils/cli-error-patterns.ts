@@ -124,7 +124,8 @@ export const CLASSIFIER_PATTERNS: Array<{ code: CliErrorReasonCode; regex: RegEx
   // Highly-specific phrase so ordering-insensitive, but keep near top for provenance clarity.
   {
     code: 'upstream_policy_reject',
-    regex: /flagged for possible cybersecurity risk/i,
+    // AGY 2026-10-18, human3195: response rejected after four upstream output attempts.
+    regex: /flagged for possible cybersecurity risk|Your previous response was blocked by content safety filters/i,
   },
   // clowder-ai#1324 (refs #848 "CLI upgrade with format incompatibility"): the CLI's own
   // argument parser rejected the argv the harness built. Deterministic — the same argv is
@@ -168,7 +169,7 @@ export const CLASSIFIER_PATTERNS: Array<{ code: CliErrorReasonCode; regex: RegEx
   {
     code: 'auth_failed',
     regex:
-      /(\b401\b|Unauthorized|invalid api key|authentication failed|forbidden.*api|profile is not authenticated|Authentication required\. Please visit the URL to log in|authentication interrupted)/i,
+      /(\b401\b|Unauthorized|invalid api key|authentication failed|forbidden.*api|profile is not authenticated|Authentication required\. Please visit the URL to log in|authentication interrupted|Not logged in\s*[·.:-]?\s*Please run \/login|The provided authorization grant is invalid|provider managed:kimi-code has no credential configured)/i,
   },
   // F212 Phase E (cloud codex P1 fix per @co-creator organic 2026-05-29): server-side temporary
   // throttling is NOT a user quota problem. CC explicitly disambiguates with "(not your usage
