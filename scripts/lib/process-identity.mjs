@@ -1,7 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readlinkSync, realpathSync } from 'node:fs';
+import { readlinkSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { compareStableBirth, readProcBirth } from './process-birth-identity.mjs';
 import { isProcessRunning } from './process-tree.mjs';
+
+export { compareStableBirth } from './process-birth-identity.mjs';
 
 export const PROCESS_START_TIME_FORMAT = 'ps-lstart-utc-c-v1';
 export const TOKEN_ARG = '--cat-cafe-daemon-token=';
@@ -31,38 +34,6 @@ function stableProcessStart(pid, runPs) {
   const startedAtEpochMs = Date.parse(`${startedAt} UTC`);
   if (!Number.isSafeInteger(startedAtEpochMs)) throw new Error(`Cannot parse process start time for PID ${pid}`);
   return { startedAt, startedAtEpochMs };
-}
-
-/**
- * Linux has a birth identity that does not follow the wall clock: field 22 of
- * /proc/<pid>/stat counts clock ticks since boot, and boot_id distinguishes
- * reboots. `ps lstart` is derived from the current wall clock, so a host
- * suspend/resume with a clock jump changes it for an unchanged process - a
- * production deployment was refused with `process-identity-mismatch` that way.
- *
- * Undefined on non-Linux hosts and whenever the files are unreadable: callers
- * keep the ps-based fallback rather than guessing.
- */
-function readProcBirth(pid) {
-  if (process.platform !== 'linux') return undefined;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const closingParen = stat.lastIndexOf(')');
-    if (closingParen < 0) return undefined;
-    // After the comm field: state is field 3, so starttime (field 22) is [19].
-    const fields = stat.slice(closingParen + 2).trim().split(/\s+/);
-    const procStartTicks = Number(fields[19]);
-    if (!Number.isSafeInteger(procStartTicks) || procStartTicks < 0) return undefined;
-    let bootId;
-    try {
-      bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || undefined;
-    } catch {
-      bootId = undefined;
-    }
-    return { procStartTicks, ...(bootId ? { bootId } : {}) };
-  } catch {
-    return undefined;
-  }
 }
 
 function processCwd(pid) {
@@ -204,21 +175,6 @@ export function spawnedIdentityRefusal(pid, identity, expectedRoot, launchToken)
   };
 }
 
-/**
- * @returns {true|false|undefined} true/false when both sides carry the stable
- * Linux marker; undefined when either side predates it (or runs on macOS).
- */
-export function compareStableBirth(stored, identity) {
-  if (!Number.isSafeInteger(stored?.procStartTicks) || !Number.isSafeInteger(identity?.procStartTicks)) {
-    return undefined;
-  }
-  if (stored.procStartTicks !== identity.procStartTicks) return false;
-  const storedBootId = typeof stored.bootId === 'string' ? stored.bootId : '';
-  const currentBootId = typeof identity.bootId === 'string' ? identity.bootId : '';
-  if (storedBootId && currentBootId && storedBootId !== currentBootId) return false;
-  return true;
-}
-
 function identityMatches(state, identity) {
   const stored = state.process;
   if (!stored || !stored.startedAt || stored.cwd !== identity.cwd) return false;
@@ -268,8 +224,8 @@ export function compareStoredIdentity(state, identity) {
   const stableBirth = compareStableBirth(stored, identity);
   if (stableBirth === false) return 'mismatch';
   if (stableBirth === true) return 'unknown';
-  const bothStable = Number.isSafeInteger(stored.startedAtEpochMs) && Number.isSafeInteger(identity.startedAtEpochMs);
-  if (bothStable && stored.startedAtEpochMs !== identity.startedAtEpochMs) return 'mismatch';
+  // lstart follows the wall clock. Without conclusive birth evidence, an
+  // unreadable argv cannot establish replacement or authorize stop cleanup.
   return 'unknown';
 }
 
