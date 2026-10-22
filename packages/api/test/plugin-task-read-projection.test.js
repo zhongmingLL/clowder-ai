@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { safeParseExtra, serializeExtra } from '../dist/domains/cats/services/stores/redis/redis-message-parsers.js';
 import { withPluginCallContext } from '../dist/domains/plugin/carrier/plugin-call-context.js';
 import { createPluginTaskHost } from '../dist/domains/plugin/host-surface/task/plugin-task-host.js';
 
@@ -70,6 +71,75 @@ test('all task read slots project owner and minimal entrusted work without autho
     assert.notEqual(item.entrustedWork.artifactRefs, task.entrustedWork.artifactRefs);
     assert.notEqual(item.entrustedWork.admission.sourceRefs, task.entrustedWork.admission.sourceRefs);
   }
+});
+
+test('all task read slots expose only a verified old Host admission coordinate for legacy continuation', async () => {
+  const task = {
+    ...minimal,
+    userId: 'owner',
+    entrustedWork: {
+      revision: 3,
+      artifactRefs: [],
+      closure: { state: 'open' },
+      admission: {
+        basis: 'authorized_source',
+        sourceRefs: ['message:source'],
+        authorityRef: 'message:host-receipt',
+      },
+    },
+  };
+  const receipt = {
+    id: 'host-receipt',
+    userId: 'owner',
+    threadId: 'thread',
+    catId: null,
+    from: { kind: 'user', userId: 'owner' },
+    content: 'Host admission receipt',
+    mentions: [],
+    timestamp: 1,
+    extra: {
+      collectiveOwnerAdmissionV1: {
+        v: 1,
+        sourceRef: 'message:source',
+        catId: 'cat',
+        ownerAuthProvenance: 'strict',
+      },
+    },
+  };
+  const admission = {
+    messageStore: {
+      getById: async (id) =>
+        id === receipt.id
+          ? { ...structuredClone(receipt), extra: safeParseExtra(serializeExtra(receipt.extra)) }
+          : undefined,
+    },
+    isCatAvailable: () => true,
+    assertCurrent: async () => {},
+    readCurrentDataControllerAuthority: async () => undefined,
+    withCurrentDataControllerAuthority: async () => {
+      throw new Error('unused');
+    },
+  };
+  for (const [method, arg] of reads) {
+    const result = await fixture(task, { admission })[method](arg);
+    const item = Array.isArray(result) ? result[0] : result;
+    assert.deepEqual(item.entrustedWork.admission, {
+      sourceRefs: ['message:source'],
+      authorityRef: 'message:host-receipt',
+      hostReceipt: {
+        receiptRef: 'message:host-receipt',
+        sourceRef: 'message:source',
+        catId: 'cat',
+      },
+    });
+  }
+  receipt.extra.collectiveOwnerAdmissionV1.sourceRef = 'message:another-source';
+  const rejected = await fixture(task, { admission }).get({ id: task.id });
+  assert.equal(rejected.entrustedWork.admission.hostReceipt, undefined);
+  receipt.extra.collectiveOwnerAdmissionV1.sourceRef = 'message:source';
+  receipt.extra.collectiveAuthorizationInvalid = { reason: 'revoked' };
+  const invalidated = await fixture(task, { admission }).get({ id: task.id });
+  assert.equal(invalidated.entrustedWork.admission.hostReceipt, undefined);
 });
 
 for (const [method, arg, storeMethod] of reads) {

@@ -9,6 +9,7 @@ import type { RuntimeProviderProfile } from '../src/config/account-resolver.js';
 import { resolveCatRuntimeAccount } from '../src/config/cat-runtime-account.js';
 import { CodexAgentService } from '../src/domains/cats/services/agents/providers/CodexAgentService.js';
 import type { AgentCarrierSessionOptions } from '../src/domains/cats/services/types.js';
+import { resolveCurationProvider } from '../src/domains/memory/curation-provider.js';
 import { F320AccountWire } from './helpers/f320-account-wire.js';
 
 function fixture(t: TestContext, accountRef?: string) {
@@ -69,6 +70,43 @@ test('all native readers bypass an unrelated app default while explicit bindings
   assert.equal(explicit?.authType, 'api_key');
   assert.equal(explicit?.apiKey, 'other-key');
 });
+
+for (const accountRef of [undefined, '   ', 'curator-api']) {
+  test(`curation respects native CLI authority with ${accountRef === 'curator-api' ? 'an explicit account' : 'no explicit account'}`, (t) => {
+    const f = fixture(t, accountRef);
+    mkdirSync(join(f.root, '.cat-cafe'));
+    writeFileSync(
+      join(f.root, '.cat-cafe', 'accounts.json'),
+      JSON.stringify({
+        codex: { authType: 'api_key', clientId: 'openai', baseUrl: 'https://unrelated.invalid/v1' },
+        'curator-api': {
+          authType: 'api_key',
+          clientId: 'openai',
+          baseUrl: 'https://selected.invalid/v1',
+          envVars: { CODEX_HOME: join(f.root, 'selected-codex'), CURATOR_ONLY: 'selected-env' },
+        },
+      }),
+    );
+    writeFileSync(
+      join(f.root, '.cat-cafe', 'credentials.json'),
+      JSON.stringify({ codex: { apiKey: 'unrelated-key' }, 'curator-api': { apiKey: 'selected-key' } }),
+    );
+    const { options } = resolveCurationProvider(f.root, f.id);
+    if (accountRef === 'curator-api') {
+      assert.equal(options.callbackEnv?.CODEX_AUTH_MODE, 'api_key');
+      assert.equal(options.callbackEnv?.OPENAI_API_KEY, 'selected-key');
+      assert.equal(options.accountEnv?.CURATOR_ONLY, 'selected-env');
+      assert.equal(options.codexAccountLaunch?.accountRef, accountRef);
+      assert.equal(options.codexAccountLaunch?.authMode, 'api_key');
+      assert.equal(options.codexAccountLaunch?.credentialHome, join(f.root, 'selected-codex'));
+    } else {
+      assert.equal(options.callbackEnv?.CODEX_AUTH_MODE, undefined);
+      assert.equal(options.callbackEnv?.OPENAI_API_KEY, undefined);
+      assert.equal(options.accountEnv, undefined);
+      assert.equal(options.codexAccountLaunch, undefined);
+    }
+  });
+}
 
 for (const kind of ['absent', 'synthetic-oauth', 'synthetic-api', 'unbound-default'] as const) {
   test(`native capability launch preserves CLI authority with ${kind} account input`, async (t) => {

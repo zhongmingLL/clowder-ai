@@ -71,6 +71,7 @@ export interface AcpPoolClient {
   readonly isSafeForSingleFlightReuse?: boolean;
   /** Session-scoped counterpart used to seal only the cancelled logical session on multiplexed carriers. */
   isSessionSafeForReuse?(sessionId: string): boolean;
+  closeSession?(sessionId: string): Promise<void>;
   initialize(): Promise<unknown>;
   close(): Promise<void>;
 }
@@ -83,6 +84,7 @@ export type AcpClientFactory = () => AcpPoolClient; // eslint-disable-line @type
 
 interface AcpPoolVariantConfig {
   supportsMultiplexing?: boolean;
+  rejectActiveSessionLease?: boolean;
 }
 
 interface PoolEntry {
@@ -115,6 +117,7 @@ export class AcpProcessPool {
   readonly spawnSignature?: string;
   private readonly config: AcpPoolConfig;
   private readonly supportsMultiplexing: boolean;
+  private readonly rejectActiveSessionLease: boolean;
   private readonly entries = new Map<string, PoolEntry[]>();
   private readonly sessionOwners = new Map<string, PoolEntry>();
   /** Persisted session ids that must never be loaded again after unacknowledged local termination. */
@@ -149,6 +152,11 @@ export class AcpProcessPool {
       healthCheckIntervalMs: config.healthCheckIntervalMs ?? 30_000,
     };
     this.supportsMultiplexing = resolveSupportsMultiplexing(variantConfig);
+    this.rejectActiveSessionLease = Boolean(
+      variantConfig &&
+        typeof variantConfig === 'object' &&
+        (variantConfig as AcpPoolVariantConfig).rejectActiveSessionLease === true,
+    );
     this.clientFactory = clientFactory;
     this.startHealthCheck();
   }
@@ -184,6 +192,8 @@ export class AcpProcessPool {
       } else {
         const owner = this.sessionOwners.get(sessionKey);
         if (owner && owner.state === 'ready' && owner.client.isAlive) {
+          if (this.rejectActiveSessionLease && owner.leaseCount > 0)
+            throw new Error('ACP session has an active lease; refusing concurrent ownership');
           if (!this.supportsMultiplexing && owner.client.isSafeForSingleFlightReuse === false) {
             this.sealSession(poolKey, sessionId);
             canResumeRequestedSession = false;
@@ -250,6 +260,13 @@ export class AcpProcessPool {
 
     const entry = await spawnPromise;
     return this.createLease(entry, poolKey, canResumeRequestedSession);
+  }
+
+  async releaseSession(poolKey: PoolKey, sessionId: string): Promise<void> {
+    const key = serializeSessionKey(poolKey, sessionId);
+    const owner = this.sessionOwners.get(key);
+    this.sessionOwners.delete(key);
+    await owner?.client.closeSession?.(sessionId);
   }
 
   /** Seal a logical session after local termination without provider quiescence. */

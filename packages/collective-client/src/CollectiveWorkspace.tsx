@@ -11,10 +11,13 @@ import {
   writeLibraryTarget,
 } from './channel-navigation.js';
 import type { CollectiveEventEnvelope, CollectiveWorkProjection } from './client-types.js';
+import { useCollectiveLanguage, useCollectiveText } from './collective-copy.js';
 import { type RoadmapReturn, visibleCollectiveCats } from './collective-workspace-model.js';
 import { FirstEntryOverlays } from './first-entry/FirstEntryOverlays.js';
 import { useFirstEntryGuide } from './first-entry/use-first-entry-guide.js';
 import { collectiveClientNamespace } from './human-send-custody.js';
+import { LeaveCollectiveDialog } from './LeaveCollectiveDialog.js';
+import type { LeaveReadinessArtifact, LeaveReadinessProject, LeaveReadinessWork } from './leave-readiness.js';
 import type { MemberSelection } from './MemberPanel.js';
 import { ProductShell } from './ProductShell.js';
 import { defaultRoadmapView, type RoadmapViewState } from './roadmap-view-model.js';
@@ -35,6 +38,8 @@ export function CollectiveWorkspace({
   readonly embedded: boolean;
   readonly client: ReturnType<typeof useCollectiveClient>;
 }) {
+  const language = useCollectiveLanguage();
+  const t = useCollectiveText();
   const { snapshot } = client;
   const namespace = collectiveClientNamespace(snapshot) ?? '';
   const previousNamespace = useRef(namespace);
@@ -49,6 +54,7 @@ export function CollectiveWorkspace({
   const [libraryChannel, setLibraryChannel] = useState<{ channelId: string; revision: number }>();
   const [navigationOpen, setNavigationOpen] = useState(false);
   const [selectedMember, setSelectedMember] = useState<MemberSelection | 'members'>();
+  const [leaveDialogOpen, setLeaveDialogOpen] = useState(false);
   const participants = snapshot.participants ?? [];
   const channels = channelDestinations(snapshot.events, participants);
   const mediaArtifact = client.artifacts?.catalogue.find(
@@ -234,6 +240,7 @@ export function CollectiveWorkspace({
     setQuery('');
     setSelectedMember(undefined);
     setNavigationOpen(false);
+    setLeaveDialogOpen(false);
     host.hide();
   }, [namespace]);
   if (!snapshot.collective || !snapshot.me) return null;
@@ -255,7 +262,7 @@ export function CollectiveWorkspace({
     artifactNavigation.discard();
     const roadmap = snapshot.collaboration?.roadmaps.find((candidate) => candidate.roadmapId === view.roadmapId);
     setRoadmapViews((current) => ({ ...current, [channelId]: view }));
-    setRoadmapReturn({ channelId, label: roadmap?.title ?? '项目', view });
+    setRoadmapReturn({ channelId, label: roadmap?.title ?? t('项目'), view });
     setFocusEventId(eventId);
     setDestination('channel');
     setContent('conversation');
@@ -280,6 +287,52 @@ export function CollectiveWorkspace({
     setNavigationOpen(false);
     setQuery('');
   };
+  const openReadinessProject = (project: LeaveReadinessProject, workId?: string) => {
+    const currentProject = snapshot.collaboration?.roadmaps.find(
+      (candidate) => candidate.roadmapId === project.roadmapId,
+    );
+    if (!currentProject || (workId && !currentProject.workIds.includes(workId))) {
+      selectChannel(project.source.location.channelId, project.source.eventId);
+      return;
+    }
+    artifactNavigation.discard();
+    setDestination('channel');
+    setChannelId(project.source.location.channelId);
+    setFocusEventId(undefined);
+    setContent('roadmap');
+    setRoadmapReturn(undefined);
+    setRoadmapViews((current) => ({
+      ...current,
+      [project.source.location.channelId]: {
+        ...defaultRoadmapView,
+        workspace: 'project',
+        roadmapId: project.roadmapId,
+        ...(workId ? { workId } : {}),
+      },
+    }));
+    setQuery('');
+    setSelectedMember(undefined);
+    setNavigationOpen(false);
+    host.hide();
+    writeChannelTarget(project.source.location.channelId);
+  };
+  const openReadinessWork = (work: LeaveReadinessWork) => {
+    const project = work.projects.length === 1 ? work.projects[0] : undefined;
+    const currentWork = snapshot.collaboration?.works.find((candidate) => candidate.workId === work.workId);
+    if (project && currentWork) {
+      openReadinessProject(project, work.workId);
+      return;
+    }
+    selectChannel(work.source.location.channelId, work.source.eventId);
+  };
+  const openReadinessArtifact = (item: Extract<LeaveReadinessArtifact, { kind: 'artifact' }>) => {
+    const current = client.artifacts?.catalogue.find((candidate) => candidate.artifactId === item.artifactId);
+    if (current) {
+      artifactNavigation.open(current, item.ownerRevision);
+      return;
+    }
+    selectChannel(item.source.location.channelId, item.source.eventId);
+  };
 
   return (
     <CollectiveArtifactContext.Provider
@@ -288,6 +341,10 @@ export function CollectiveWorkspace({
           ...client.artifacts,
           open: artifactNavigation.open,
           close: artifactNavigation.close,
+          openWorkResultFile: async (address) => {
+            const artifact = await client.artifacts?.resolveWorkResultFile(address);
+            if (artifact) artifactNavigation.open(artifact);
+          },
           returnLabel: artifactNavigation.returnLabel,
           returnToSource: selectChannel,
         }
@@ -307,16 +364,20 @@ export function CollectiveWorkspace({
             canSteward={snapshot.collective.role === 'steward'}
             canPair={Boolean(snapshot.me.auth) && !host.paired}
             pairNudge={firstEntry.phase === 'browsing'}
-            canLeave={snapshot.collective.role === 'member'}
             headerMeta={
               members
-                ? `${members.cafes.length} 个 Café · ${members.humans.length + visibleCats.length} 位成员`
-                : '正在读取成员…'
+                ? language === 'en'
+                  ? `${members.cafes.length} ${members.cafes.length === 1 ? 'Café' : 'Cafés'} · ${members.humans.length + visibleCats.length} ${members.humans.length + visibleCats.length === 1 ? 'member' : 'members'}`
+                  : `${members.cafes.length} 个 Café · ${members.humans.length + visibleCats.length} 位成员`
+                : t('正在读取成员…')
             }
             notice={snapshot.notice}
             onInvite={() => void client.createInvite()}
             onPair={beginPair}
-            onLeave={() => void client.leaveCollective()}
+            onLeave={() => {
+              setNavigationOpen(false);
+              setLeaveDialogOpen(true);
+            }}
             onCafe={host.available ? showMembers : undefined}
             onPermissions={host.available ? () => showPrivateSection('permissions') : undefined}
             onCalendar={host.available ? () => showPrivateSection('calendar') : undefined}
@@ -363,7 +424,7 @@ export function CollectiveWorkspace({
           >
             <SharedArtifactLibrary
               key={namespace}
-              title="全部作品"
+              title={t('全部作品')}
               active={destination === 'library'}
               filterable
               requestedChannel={libraryChannel}
@@ -408,6 +469,18 @@ export function CollectiveWorkspace({
               />
             ) : null}
           </ProductShell>
+          {leaveDialogOpen && (
+            <LeaveCollectiveDialog
+              collectiveName={snapshot.collective.name}
+              read={client.readLeaveReadiness}
+              leave={client.leaveCollective}
+              onClose={() => setLeaveDialogOpen(false)}
+              onOpenWork={openReadinessWork}
+              onOpenProject={openReadinessProject}
+              onOpenArtifact={openReadinessArtifact}
+              onOpenMembers={showMembers}
+            />
+          )}
           <FirstEntryOverlays
             firstEntry={firstEntry}
             destination={destination}

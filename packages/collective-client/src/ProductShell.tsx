@@ -1,14 +1,13 @@
 import type { MouseEvent, ReactNode } from 'react';
 import { CollectiveWorldRail } from './CollectiveWorldRail.js';
 import type { CollectiveMembership } from './client-types.js';
-import { useCollectiveText } from './collective-copy.js';
+import { useCollectiveLanguage, useCollectiveText } from './collective-copy.js';
 
 function DestinationTitle({
   collective,
   onHome,
   meta,
   canSteward,
-  canLeave,
   onInvite,
   onCafe,
   onReplayGuide,
@@ -21,7 +20,6 @@ function DestinationTitle({
   readonly onHome?: () => void;
   readonly meta?: ReactNode;
   readonly canSteward: boolean;
-  readonly canLeave: boolean;
   readonly onInvite: () => void;
   readonly onCafe?: () => void;
   readonly onReplayGuide?: () => void;
@@ -30,9 +28,10 @@ function DestinationTitle({
   readonly onReconnect?: () => void;
   readonly onLeave?: () => void;
 }) {
+  const language = useCollectiveLanguage();
   const t = useCollectiveText();
   if (!collective) return <h1>{t('共同家园')}</h1>;
-  const hasMenu = Boolean(onHome || canSteward || onCafe || onReplayGuide || (canLeave && onLeave));
+  const hasMenu = Boolean(onHome || canSteward || onCafe || onReplayGuide || onLeave);
   if (!hasMenu) return <h1>{collective.name}</h1>;
   const action = (callback: () => void) => (event: MouseEvent<HTMLButtonElement>) => {
     event.currentTarget.closest('details')?.removeAttribute('open');
@@ -40,7 +39,7 @@ function DestinationTitle({
   };
   return (
     <details className="collective-menu">
-      <summary aria-label={`${collective.name}菜单`}>
+      <summary aria-label={language === 'en' ? `${collective.name} menu` : `${collective.name}菜单`}>
         <h1>{collective.name}</h1>
         <span aria-hidden="true">⌄</span>
       </summary>
@@ -48,7 +47,9 @@ function DestinationTitle({
         <button
           type="button"
           className="collective-menu-heading"
-          aria-label={onHome ? `打开${collective.name}首页` : undefined}
+          aria-label={
+            onHome ? (language === 'en' ? `Open ${collective.name} home` : `打开${collective.name}首页`) : undefined
+          }
           onClick={onHome ? action(onHome) : undefined}
         >
           <strong>{collective.name}</strong>
@@ -84,7 +85,7 @@ function DestinationTitle({
             {t('再看一遍介绍')}
           </button>
         )}
-        {canLeave && onLeave && (
+        {onLeave && (
           <button type="button" className="collective-menu-muted" onClick={action(onLeave)}>
             {t('离开共同体…')}
           </button>
@@ -104,7 +105,6 @@ export function ProductShell({
   canSteward,
   canPair,
   pairNudge = false,
-  canLeave = false,
   notice,
   onInvite,
   onPair,
@@ -129,7 +129,6 @@ export function ProductShell({
   readonly canSteward: boolean;
   readonly canPair: boolean;
   readonly pairNudge?: boolean;
-  readonly canLeave?: boolean;
   readonly notice?: string;
   readonly onInvite: () => void;
   readonly onPair: () => void;
@@ -172,7 +171,6 @@ export function ProductShell({
             onHome={onHome}
             meta={headerMeta}
             canSteward={canSteward}
-            canLeave={canLeave}
             onInvite={onInvite}
             onCafe={onCafe}
             onReplayGuide={onReplayGuide}
@@ -190,12 +188,12 @@ export function ProductShell({
           {embedded && canPair && (
             <div className="steward-actions">
               <button type="button" className={pairNudge ? 'pair-nudge' : undefined} data-guide-pair onClick={onPair}>
-                连接此 Café
+                {t('连接此 Café')}
               </button>
             </div>
           )}
           {notice && <p className="destination-notice">{t(notice)}</p>}
-          {connection === 'offline' && <p className="connection-line">暂时离线 · 发送失败后可以重试</p>}
+          {connection === 'offline' && <p className="connection-line">{t('暂时离线 · 发送失败后可以重试')}</p>}
         </footer>
       </aside>
       <section className="primary-scene" data-spatial-role="primary-scene">

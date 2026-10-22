@@ -789,9 +789,12 @@ export class AcpHttpStreamClient {
     };
 
     if (req.method === ACP_METHODS.requestPermission) {
-      const respond = (result: { optionId: string }) => {
+      const respond = (result: { optionId: string } | { cancelled: true }) => {
         const acpResult = {
-          outcome: { outcome: 'selected' as const, optionId: result.optionId },
+          outcome:
+            'cancelled' in result
+              ? { outcome: 'cancelled' as const }
+              : { outcome: 'selected' as const, optionId: result.optionId },
         };
         return this.sendAgentResponse({ jsonrpc: '2.0', id: req.id, result: acpResult }, responseOptions);
       };
@@ -799,7 +802,7 @@ export class AcpHttpStreamClient {
       if (this.config.permissionHandler) {
         let responsePromise: Promise<void> | null = null;
         try {
-          this.config.permissionHandler(req, (result) => {
+          await this.config.permissionHandler(req, (result) => {
             responsePromise = respond(result);
           });
         } catch (err) {

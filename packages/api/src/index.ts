@@ -1,4 +1,11 @@
 import { AgentServiceUnavailableError } from './domains/cats/services/agents/registry/AgentServiceUnavailableError.js';
+import { createRefreshingAcpSessionProvider } from './domains/cats/services/agents/session-contract/acp-session-provider.js';
+import { SessionImplementationRegistry } from './domains/cats/services/agents/session-contract/implementation-registry.js';
+import {
+  RegisteredSessionAgentService,
+  selectSessionAgentService,
+} from './domains/cats/services/agents/session-contract/registered-session-agent-service.js';
+import { readSessionContractSettings } from './domains/cats/services/agents/session-contract/session-contract-settings.js';
 import {
   createHostMediaPathResolver,
   hostMediaPathRootsFromEnv,
@@ -8,6 +15,7 @@ import { createListenAssetSpeech } from './domains/messaging/outbound-media/spee
 import { createPublishingMessageStore } from './domains/messaging/publishing-message-store.js';
 import { createMessagingStores } from './domains/messaging/stores/factory.js';
 import { SubscriptionDrainScheduler } from './domains/messaging/subscription-drain-scheduler.js';
+import { declaredAgentSessionProviders } from './domains/plugin/declared/declared-agent-session-providers.js';
 import { PLUGIN_HOST_ENTRIES, pluginHostRoot } from './domains/plugin/host-inventory/plugin-host-layout.js';
 import { createPluginConversationDelivery } from './domains/plugin/host-surface/plugin-conversation-delivery.js';
 import { catRegistryMentionPatterns } from './infrastructure/connectors/mention-parser.js';
@@ -28,6 +36,7 @@ import {
   CORE_COMMANDS,
   catRegistry,
   createCatId,
+  deploymentDefaults,
   type EventMemoryRecord,
   type ILimbNode,
 } from '@cat-cafe/shared';
@@ -246,6 +255,7 @@ import {
 } from './domains/growing/EntrustedWorkOwnerReadService.js';
 import { EntrustedWorkTaskExecutionService } from './domains/growing/EntrustedWorkTaskExecutionService.js';
 import { F232PreparedArtifactReader } from './domains/growing/F232PreparedArtifactReader.js';
+import { F290CollectiveWorkResultPluginAdapter } from './domains/growing/F290CollectiveWorkResultPluginAdapter.js';
 import { F246NeedsMeProducerAdapter, F306NeedsMeProducerAdapter } from './domains/growing/NeedsMeProducerAdapter.js';
 import { NeedsMeProducerCatalog } from './domains/growing/NeedsMeProducerCatalog.js';
 import { ActivityTracker } from './domains/health/ActivityTracker.js';
@@ -571,7 +581,7 @@ import { resolveCatCafeSkillsSource } from './utils/skill-source.js';
 import { buildThreadDeepLink } from './utils/thread-deep-link.js';
 import { getDefaultConnectorMediaDir, getDefaultUploadDir } from './utils/upload-paths.js';
 
-const PORT = parseInt(process.env.API_SERVER_PORT ?? '3004', 10);
+const PORT = parseInt(process.env.API_SERVER_PORT ?? String(deploymentDefaults.apiPort), 10);
 const HOST = process.env.API_SERVER_HOST ?? '127.0.0.1';
 
 let socketManager: SocketManager | null = null;
@@ -1980,6 +1990,10 @@ async function main(): Promise<void> {
 
   // ── F149 Phase C: ACP process pool registry (variantId → AcpProcessPool) ──
   const acpPoolRegistry: AcpPoolRegistry = new Map();
+  const sessionContractSettings = readSessionContractSettings(process.env);
+  for (const warning of sessionContractSettings.warnings) app.log.warn(warning);
+  const sessionImplementations = new SessionImplementationRegistry();
+  const registeredSessionServices = new Map<string, RegisteredSessionAgentService>();
   // F254: Codex app-server warm hosts are profile-scoped and survive catalog refreshes.
   const codexAppServerPoolRegistry: CodexAppServerPoolRegistry = new Map();
   const nativeRealtimeCompanionEnabled = isNativeRealtimeCompanionDeployment(process.env.CAT_CAFE_DEPLOYMENT_ID);
@@ -1987,7 +2001,9 @@ async function main(): Promise<void> {
   // ── F32-b: AgentRegistry (catId → AgentService) — one instance per cat ──
   // Each cat gets its own AgentService instance with its catId + model.
   const agentRegistry = new AgentRegistry();
+  let sessionConfigurationRevision = 0;
   const syncAgentRegistry = async (configs: Record<string, CatConfig>, warmPrompts = true) => {
+    sessionConfigurationRevision++;
     agentRegistry.reset();
     clearL0Cache(); // Invalidate stale L0 compilations from previous sync
     const projectRoot = resolveActiveProjectRoot();
@@ -2000,112 +2016,139 @@ async function main(): Promise<void> {
           const catId = config.id;
           // F32-b P1 fix: do NOT pass model here — let constructors resolve via
           // getCatModel(catId) which respects env override (CAT_*_MODEL > config > fallback)
-          let service: AgentService;
-
-          // ── F161: Generic ACP transport path (provider-agnostic) ──
-          // Carrier selection is resolved once by cat-config-loader. The ACP block
-          // below contains only launch details; its mere presence is not routing truth.
-          const acpConfig = config.carrier === 'acp' ? getAcpConfig(id, projectRoot) : undefined;
-          if (config.carrier === 'acp') {
-            if (!acpConfig) {
-              app.log.warn(`[api] Cat "${id}" selects carrier=acp but has no ACP config. It will not be routable.`);
-              return;
-            }
-            activeAcpProfileIds.add(id);
-            let acpService: Awaited<ReturnType<typeof createAcpServiceForConfig>>;
-            try {
-              acpService = await createAcpServiceForConfig({
-                projectRoot,
-                profileId: id,
-                config,
-                effectiveModel: getCatModel(id),
-                acpConfig,
-                poolRegistry: acpPoolRegistry,
-                log: app.log,
-                onUnavailable: (reason) => agentRegistry.markUnavailable(id, reason),
-              });
-            } catch (error) {
-              // A single member's bootstrap/privacy failure must not keep the API
-              // from listening; degrade that member and keep every other cat.
-              const reason = error instanceof Error ? error.message : String(error);
-              app.log.warn(`[api] Cat "${id}" ACP startup failed; marking it unavailable: ${reason}`);
-              agentRegistry.markUnavailable(id, { code: 'ACP_BOOTSTRAP_UNAVAILABLE', message: reason });
-              return;
-            }
-            if (!acpService) return;
-            service = acpService;
-          } else
-            switch (config.clientId) {
-              // ── Provider-specific CLI paths (non-ACP) ──
-              case 'anthropic': {
-                if (config.carrier === 'sdk') {
-                  service = new ClaudeSdkAgentService({ catId });
-                } else {
-                  const { createClaudeAgentServiceForCanary } = await import(
-                    './domains/cats/services/agents/providers/claude-carrier-factory.js'
-                  );
-                  service = createClaudeAgentServiceForCanary(catId);
-                }
-                break;
-              }
-              case 'openai': {
-                activeCodexProfileIds.add(id);
-                const appServerHostPool = getOrCreateCodexAppServerPool(codexAppServerPoolRegistry, id);
-                service = new CodexAgentService({
+          const service = await selectSessionAgentService<AgentService | undefined | Promise<AgentService | undefined>>(
+            sessionContractSettings.bindings.get(id),
+            (sessionRef) => {
+              activeAcpProfileIds.add(id);
+              const registered =
+                registeredSessionServices.get(id) ??
+                new RegisteredSessionAgentService({
                   catId,
-                  appServerHostPool,
-                  carrierMode: config.carrier === 'app_server' ? 'app_server' : 'exec_json',
-                  nativeRealtimeCompanionEnabled,
+                  ref: sessionRef,
+                  registry: sessionImplementations,
+                  metadata: { provider: config.provider ?? 'acp', model: getCatModel(id) },
+                  log: app.log,
                 });
-                break;
-              }
-              case 'google':
+              registeredSessionServices.set(id, registered);
+              return registered;
+            },
+            async () => {
+              let service: AgentService;
+              // ── F161: Generic ACP transport path (provider-agnostic) ──
+              // Carrier selection is resolved once by cat-config-loader. The ACP block
+              // below contains only launch details; its mere presence is not routing truth.
+              const acpConfig = config.carrier === 'acp' ? getAcpConfig(id, projectRoot) : undefined;
+              if (config.carrier === 'acp') {
+                if (!acpConfig) {
+                  app.log.warn(`[api] Cat "${id}" selects carrier=acp but has no ACP config. It will not be routable.`);
+                  return;
+                }
+                activeAcpProfileIds.add(id);
+                let acpService: Awaited<ReturnType<typeof createAcpServiceForConfig>>;
                 try {
-                  service = createGoogleAgentService(catId, config.agyProfile);
+                  acpService = await createAcpServiceForConfig({
+                    projectRoot,
+                    profileId: id,
+                    config,
+                    effectiveModel: getCatModel(id),
+                    acpConfig,
+                    poolRegistry: acpPoolRegistry,
+                    log: app.log,
+                    onUnavailable: (reason) => agentRegistry.markUnavailable(id, reason),
+                  });
                 } catch (error) {
-                  if (!(error instanceof AgentServiceUnavailableError)) throw error;
-                  agentRegistry.markUnavailable(id, error.reason);
+                  // A single member's bootstrap/privacy failure must not keep the API
+                  // from listening; degrade that member and keep every other cat.
+                  const reason = error instanceof Error ? error.message : String(error);
+                  app.log.warn(`[api] Cat "${id}" ACP startup failed; marking it unavailable: ${reason}`);
+                  agentRegistry.markUnavailable(id, { code: 'ACP_BOOTSTRAP_UNAVAILABLE', message: reason });
                   return;
                 }
-                break;
-              case 'kimi':
-                service = new KimiAgentService({ catId });
-                break;
-              case 'antigravity':
-                agentRegistry.markUnavailable(id, {
-                  code: 'AGY_IDE_EXECUTION_RETIRED',
-                  message: 'AGY IDE 执行入口已退役。请在成员设置选择 Google 的 AGY Native 入口；成员身份与历史保留。',
-                });
-                return;
-              case 'opencode':
-                service = new OpenCodeAgentService({ catId });
-                break;
-              case 'catagent': {
-                const { CatAgentService } = await import(
-                  './domains/cats/services/agents/providers/catagent/CatAgentService.js'
-                );
-                service = new CatAgentService({ catId, projectRoot: findMonorepoRoot(), catConfig: config });
-                break;
-              }
-              case 'a2a': {
-                const { A2AAgentService } = await import('./domains/cats/services/agents/providers/A2AAgentService.js');
-                const envKey = `CAT_${id.toUpperCase()}_A2A_URL`;
-                const a2aUrl = process.env[envKey] ?? '';
-                if (!a2aUrl) {
-                  app.log.warn(`[api] A2A cat "${id}" missing ${envKey} env var. It will not be routable.`);
-                  return;
+                if (!acpService) return;
+                service = acpService;
+              } else
+                switch (config.clientId) {
+                  // ── Provider-specific CLI paths (non-ACP) ──
+                  case 'anthropic': {
+                    if (config.carrier === 'sdk') {
+                      service = new ClaudeSdkAgentService({ catId });
+                    } else {
+                      const { createClaudeAgentServiceForCanary } = await import(
+                        './domains/cats/services/agents/providers/claude-carrier-factory.js'
+                      );
+                      service = createClaudeAgentServiceForCanary(catId);
+                    }
+                    break;
+                  }
+                  case 'openai': {
+                    activeCodexProfileIds.add(id);
+                    const appServerHostPool = getOrCreateCodexAppServerPool(codexAppServerPoolRegistry, id);
+                    service = new CodexAgentService({
+                      catId,
+                      appServerHostPool,
+                      carrierMode: config.carrier === 'app_server' ? 'app_server' : 'exec_json',
+                      nativeRealtimeCompanionEnabled,
+                    });
+                    break;
+                  }
+                  case 'google':
+                    try {
+                      service = createGoogleAgentService(catId, config.agyProfile);
+                    } catch (error) {
+                      if (!(error instanceof AgentServiceUnavailableError)) throw error;
+                      agentRegistry.markUnavailable(id, error.reason);
+                      return;
+                    }
+                    break;
+                  case 'kimi':
+                    service = new KimiAgentService({ catId });
+                    break;
+                  case 'antigravity':
+                    agentRegistry.markUnavailable(id, {
+                      code: 'AGY_IDE_EXECUTION_RETIRED',
+                      message:
+                        'AGY IDE 执行入口已退役。请在成员设置选择 Google 的 AGY Native 入口；成员身份与历史保留。',
+                    });
+                    return;
+                  case 'opencode':
+                    service = new OpenCodeAgentService({ catId });
+                    break;
+                  case 'catagent': {
+                    const { CatAgentService } = await import(
+                      './domains/cats/services/agents/providers/catagent/CatAgentService.js'
+                    );
+                    service = new CatAgentService({ catId, projectRoot: findMonorepoRoot(), catConfig: config });
+                    break;
+                  }
+                  case 'a2a': {
+                    const { A2AAgentService } = await import(
+                      './domains/cats/services/agents/providers/A2AAgentService.js'
+                    );
+                    const envKey = `CAT_${id.toUpperCase()}_A2A_URL`;
+                    const a2aUrl = process.env[envKey] ?? '';
+                    if (!a2aUrl) {
+                      app.log.warn(`[api] A2A cat "${id}" missing ${envKey} env var. It will not be routable.`);
+                      return;
+                    }
+                    service = new A2AAgentService({ catId, config: { url: a2aUrl } });
+                    break;
+                  }
+                  default:
+                    app.log.warn(`[api] Unknown client "${config.clientId}" for cat "${id}". It will not be routable.`);
+                    return;
                 }
-                service = new A2AAgentService({ catId, config: { url: a2aUrl } });
-                break;
-              }
-              default:
-                app.log.warn(`[api] Unknown client "${config.clientId}" for cat "${id}". It will not be routable.`);
-                return;
-            }
-          agentRegistry.register(id, service);
+              return service;
+            },
+          );
+          if (service) agentRegistry.register(id, service);
         },
         { catId: id },
       );
+    }
+    for (const [id, registered] of registeredSessionServices) {
+      if (configs[id]) continue;
+      await registered.releaseAll('member_removed');
+      registeredSessionServices.delete(id);
     }
     await closeStaleAcpPools(acpPoolRegistry, activeAcpProfileIds, {
       reason: 'config-sync',
@@ -3748,7 +3791,9 @@ async function main(): Promise<void> {
     './infrastructure/harness-eval/publish-verdict/git-worktree-publisher.js'
   );
   const verdictRepoFullName =
-    process.env.CAT_CAFE_VERDICT_REPO_FULL_NAME ?? process.env.CAT_CAFE_REPO_FULL_NAME ?? 'zts212653/cat-cafe';
+    process.env.CAT_CAFE_VERDICT_REPO_FULL_NAME ??
+    process.env.CAT_CAFE_REPO_FULL_NAME ??
+    deploymentDefaults.repositoryFullName;
   const harnessGitPublisher = createGitWorktreePublisher({
     repoRoot,
     expectedRepoFullName: verdictRepoFullName,
@@ -4776,10 +4821,8 @@ async function main(): Promise<void> {
   // Seed only an absent registry before plugin activation can persist schedules
   // into it. Native invoke-time MCP resolution must work without visiting Settings.
   const { initializeFirstRunCapabilities } = await import('./config/capabilities/first-run-capabilities.js');
-  const capabilityInitialization = await initializeFirstRunCapabilities(
-    await resolveInvokeCapabilityRoot(runtimeEntrypointRoot),
-    runtimeEntrypointRoot,
-  );
+  const pluginCapabilityRoot = await resolveInvokeCapabilityRoot(runtimeEntrypointRoot);
+  const capabilityInitialization = await initializeFirstRunCapabilities(pluginCapabilityRoot, runtimeEntrypointRoot);
   if (capabilityInitialization.status === 'unreadable') {
     app.log.warn('[api] Existing capabilities are unreadable; preserved without enabling default tools');
   }
@@ -4841,6 +4884,33 @@ async function main(): Promise<void> {
   const collectiveArtifactOwnerHolder: import('./domains/plugin/host-surface/collective-artifact-owner.js').CollectiveArtifactOwnerHolder =
     {};
   const pluginRuntime = cloudConversations.createRuntime({
+    agentSessionProviders: (packages) =>
+      declaredAgentSessionProviders({
+        log: app.log,
+        settings: sessionContractSettings,
+        packages,
+        registry: sessionImplementations,
+        services: registeredSessionServices,
+        createProvider: (declaration, { catId }) =>
+          createRefreshingAcpSessionProvider({
+            catId,
+            scope: acpPoolRegistry,
+            revision: () => sessionConfigurationRevision,
+            createService: () => {
+              const config = catRegistry.getAllConfigs()[catId];
+              if (!config) throw new Error('Plugin ACP member unavailable');
+              return createAcpServiceForConfig({
+                projectRoot: resolveActiveProjectRoot(),
+                profileId: catId,
+                config,
+                effectiveModel: getCatModel(catId),
+                acpConfig: declaration.acp,
+                poolRegistry: acpPoolRegistry,
+                log: app.log,
+              });
+            },
+          }),
+      }),
     collectiveArtifactOwner: collectiveArtifactOwnerHolder,
     taskArtifactReader: preparedArtifactReader,
     limbRegistry,
@@ -4858,6 +4928,7 @@ async function main(): Promise<void> {
       ],
     ]),
     projectRoot: pluginProjectRoot,
+    capabilityProjectRoot: pluginCapabilityRoot,
     editorParentOrigin: new URL(resolveFrontendBaseUrl(process.env, app.log)).origin,
     desktopExecutor: {
       open: async (launch) =>
@@ -5101,12 +5172,17 @@ async function main(): Promise<void> {
   const { createCollectiveAccountabilitySource } = await import(
     './routes/companion-collective-accountability-source.js'
   );
-  collectiveAttentionReader = createCollectiveAccountabilitySource(
-    new InstalledPluginOperations({
-      inventory: pluginRuntime.inventoryStore,
-      configuration: pluginManagerRuntime.configuration,
-      invocation: pluginRuntime.supervisor,
-    }),
+  const collectiveSourceOperations = new InstalledPluginOperations({
+    inventory: pluginRuntime.inventoryStore,
+    configuration: pluginManagerRuntime.configuration,
+    invocation: pluginRuntime.supervisor,
+  });
+  collectiveAttentionReader = createCollectiveAccountabilitySource(collectiveSourceOperations, privateUserId);
+  const { createCollectiveWorkResultAttentionSource } = await import(
+    './domains/plugin/host-surface/collective-work-result-attention.js'
+  );
+  const collectiveWorkResultAttentionSource = createCollectiveWorkResultAttentionSource(
+    collectiveSourceOperations,
     privateUserId,
   );
   await app.register(pluginOperationRoutes, { operations: installedPluginOperations });
@@ -5593,6 +5669,96 @@ async function main(): Promise<void> {
   await app.register(async (scope) => registerArtifactReviewRoutes(scope, artifactReview));
   const { registerPublishedContentRoutes } = await import('./routes/published-content-routes.js');
   registerPublishedContentRoutes(app, { media: artifactReview.media });
+  const { LivingWorkService } = await import('./domains/collaborative-content/works/service.js');
+  const { WorkCatalogue } = await import('./domains/collaborative-content/works/catalogue.js');
+  const { createWorkAuthorizer, workMediaPrincipal } = await import('./domains/collaborative-content/works/access.js');
+  const { createWorkWorkspaceSource } = await import('./domains/collaborative-content/works/workspace-source.js');
+  const { registerLivingWorkRoutes } = await import('./routes/living-work-routes.js');
+  const { WorkReviewResponseService } = await import('./domains/collaborative-content/works/review-response.js');
+  const { createWorkResponseAuthority } = await import(
+    './domains/collaborative-content/works/review-response-authority.js'
+  );
+  const { withContentTask: withWorkResponseTask } = await import(
+    './domains/video-studio/content-owner/published-media-access.js'
+  );
+  const workResponses = new WorkReviewResponseService({
+    owner: collaborativeContent.owner,
+    store: artifactReview.store,
+    onCommitted: async (reviewId) => {
+      await artifactReview.reviews.projectCommitted(reviewId);
+      await artifactReview.changed(privateUserId, reviewId);
+    },
+    authorize: createWorkResponseAuthority({
+      store: artifactReview.store,
+      media: artifactReview.media,
+      messages: messageStore,
+    }),
+    readAsset: (review, revision, principal) =>
+      artifactReview.media.read(
+        review.contentRef,
+        revision,
+        withWorkResponseTask(workMediaPrincipal(principal), review.task.taskId),
+      ),
+  });
+  artifactReview.reviews.setWorkResponseRecovery((review, principal) =>
+    workResponses.recover(review, {
+      ...principal,
+      threadId: principal.threadId ?? review.task.threadId,
+    }),
+  );
+  const livingWorks = new LivingWorkService({
+    responses: workResponses,
+    owner: collaborativeContent.owner,
+    versions: artifactReview.store.works,
+    source: createWorkWorkspaceSource(workspaceContentReviews.source),
+    authorize: createWorkAuthorizer({
+      ownerUserId: privateUserId,
+      access: artifactReview.media.access,
+      invocation: (id) => registry.peekRecord(id),
+    }),
+  });
+  const { WorkVideoContextService } = await import('./domains/collaborative-content/works/video-context.js');
+  const { createWorkContextSource } = await import('./domains/collaborative-content/works/context-source.js');
+  const { createWorkSourceBindingVerifier } = await import('./domains/collaborative-content/works/source-binding.js');
+  const workContexts = new WorkVideoContextService({
+    store: artifactReview.store.works.contexts,
+    contextSource: createWorkContextSource(workspaceContentReviews.source),
+    verifyBinding: createWorkSourceBindingVerifier({
+      projects: collaborativeContent.projects,
+      screenings: collaborativeContent.screenings,
+      reviews: artifactReview.projectReviews,
+      workDigest: async (reference, principal) =>
+        (await artifactReview.media.read(reference.contentRef, reference.ownerRevision, workMediaPrincipal(principal)))
+          .blobDigest,
+    }),
+    authorize: (reference, principal, permission) => livingWorks.authorizeVersion(reference, principal, permission),
+    media: async (reference, principal) => {
+      const asset = await artifactReview.media.read(
+        reference.contentRef,
+        reference.ownerRevision,
+        workMediaPrincipal(principal),
+      );
+      if (asset.media.kind !== 'video') throw new Error('Video context requires video bytes');
+      return asset.media;
+    },
+  });
+  artifactReview.media.setAnchorEvidenceVerifier(async (reference, anchor, principal) => {
+    const { scope } = await artifactReview.media.origin(reference.contentRef, principal);
+    if (!scope.threadId) throw new Error('Story evidence requires its original work thread');
+    await workContexts.verifyStory(reference, anchor, {
+      ...principal,
+      threadId: principal.threadId ?? scope.threadId,
+    });
+  });
+  await registerLivingWorkRoutes(app, { service: livingWorks, registry, contexts: workContexts });
+  const { registerWorkVideoAssetRoutes } = await import('./routes/work-video-asset-routes.js');
+  const { VideoProjectAssetIndex } = await import('./domains/video-studio/project/asset-index.js');
+  const { resolveWorkspaceContentRoot } = await import('./domains/workspace/workspace-content-source-factory.js');
+  registerWorkVideoAssetRoutes(app, {
+    contexts: workContexts,
+    assets: new VideoProjectAssetIndex({ resolveRoot: resolveWorkspaceContentRoot }),
+  });
+  artifactWorkLineageHolder.independent = new WorkCatalogue(livingWorks, artifactReview.store.works.contexts);
   if (!artifactReview.ledgers) throw new Error('F309 publication ledger requires the F063 source owner');
   registerWorkspaceContentReviewRoutes(app, {
     reviews: artifactReview.ledgers,
@@ -5679,8 +5845,9 @@ async function main(): Promise<void> {
       new F246NeedsMeProducerAdapter(approvalProducerRegistry),
       new F306NeedsMeProducerAdapter(runtimeInteractionRuntime.store),
       artifactReview.producer,
+      new F290CollectiveWorkResultPluginAdapter(collectiveWorkResultAttentionSource),
     ],
-    ['f246.approval', 'f306.runtime_interaction', 'f309.content_review'],
+    ['f246.approval', 'f306.runtime_interaction', 'f309.content_review', 'f290.collective_work_result'],
   );
   const { DevelopmentReturnService } = await import(
     './infrastructure/scheduler/development-return/DevelopmentReturnService.js'
@@ -7322,11 +7489,13 @@ async function main(): Promise<void> {
     const runManagedCommandWakeRecovery = (): void => {
       if (managedCommandRecoveryTickInFlight) return;
       managedCommandRecoveryTickInFlight = true;
+      const sweepStarted = performance.now();
       void recovery
         .runOnce()
         .then((stats) => {
-          if (stats.scanned > 0) {
-            app.log.info({ ...stats }, 'F167 S.1-c managed-command wake recovery sweep');
+          const elapsedMs = performance.now() - sweepStarted;
+          if (stats.scanned > 0 || elapsedMs >= 200) {
+            app.log.info({ ...stats, elapsedMs }, 'F167 S.1-c managed-command wake recovery sweep');
           }
         })
         .catch((err: unknown) => {
@@ -7370,6 +7539,7 @@ async function main(): Promise<void> {
       const deploymentWaitLifecycle = new DeploymentWaitLifecycleService({
         taskStore,
         messageStore,
+        authorizationRegistry: registry,
         deliveryDeps,
         eventLog: waitEventLog,
         log: app.log,

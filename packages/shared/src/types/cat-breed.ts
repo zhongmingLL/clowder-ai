@@ -272,6 +272,8 @@ export interface CatCafeConfigV1 {
 export interface CoCreatorConfig {
   /** Primary display name (e.g. "You") */
   readonly name: string;
+  /** Optional familiar form of address, already present in the install template. */
+  readonly nickname?: string;
   /** Alternative names cats may use (e.g. ["L.S.", "you"]) */
   readonly aliases: readonly string[];
   /** Line-start mention patterns for routing detection (e.g. ["@co-creator", "@co-creator"]) */

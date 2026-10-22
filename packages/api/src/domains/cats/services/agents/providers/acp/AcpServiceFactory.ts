@@ -24,6 +24,9 @@ import { AcpProcessPool, DEFAULT_ACP_IDLE_TTL_MS } from './AcpProcessPool.js';
 import { createAcpPoolSpawnSignature } from './acp-pool-signature.js';
 import { skipAcpProfile } from './acp-registration-failure.js';
 import { tryPrepareAcpProcessEnv } from './acp-spawn-env.js';
+import { denyAgyAcpPermission } from './agy/agy-acp-permission.js';
+import { prepareAgyAcpProfile } from './agy/agy-acp-profile.js';
+import type { AgyAcpConfig } from './agy/agy-acp-session.js';
 import {
   type AcpBootstrapContext,
   resolveAcpBootstrap,
@@ -54,6 +57,7 @@ interface AcpAccountContext {
 }
 
 interface AcpSpawnContext {
+  antigravity?: AgyAcpConfig;
   env?: Record<string, string>;
   sessionModel?: string;
   openCodeRuntimeConfig: unknown;
@@ -104,6 +108,32 @@ async function prepareAcpSpawnContext(
 ): Promise<AcpSpawnContext | null> {
   const { config, profileId } = input;
   const catId = config.id;
+  if (config.agyProfile?.carrier === 'acp') {
+    try {
+      if (
+        config.clientId !== 'google' ||
+        input.acpConfig.transport === 'httpstream' ||
+        (accountContext.account &&
+          (accountContext.account.authType !== 'oauth' || Object.keys(accountContext.account.envVars ?? {}).length))
+      ) {
+        throw new Error('AGY official ACP requires Google personal OAuth over stdio without account overrides');
+      }
+      const prepared = await prepareAgyAcpProfile({
+        catId,
+        model: input.effectiveModel,
+        projectRoot: bootstrap.projectRoot,
+        profile: config.agyProfile,
+      });
+      return { ...prepared, sessionModel: input.effectiveModel, openCodeRuntimeConfig: null, contextPolicy: null };
+    } catch (err) {
+      return skipAcpProfile(
+        input,
+        'invalid-spawn-env',
+        { err, catId, profileId, accountRef: accountContext.accountRef },
+        'ACP registry sync skipped member due to invalid AGY profile',
+      );
+    }
+  }
   const acpEnvResult = tryPrepareAcpProcessEnv({
     clientId: config.clientId,
     provider: config.provider,
@@ -191,6 +221,7 @@ async function ensureAcpPool(
     idleTtlMs: acpConfig.pool?.idleTtlMs ?? DEFAULT_ACP_IDLE_TTL_MS,
     transport: acpConfig.transport ?? 'stdio',
     supportsMultiplexing: acpConfig.supportsMultiplexing,
+    ...(spawn.antigravity ? { sessionPolicy: { provider: 'antigravity', profile: spawn.antigravity.profile } } : {}),
   });
 
   const existingPool = poolRegistry.get(profileId);
@@ -208,7 +239,7 @@ async function ensureAcpPool(
       idleTtlMs: acpConfig.pool?.idleTtlMs ?? DEFAULT_ACP_IDLE_TTL_MS,
       healthCheckIntervalMs: 30_000,
     },
-    acpConfig,
+    spawn.antigravity ? { ...acpConfig, supportsMultiplexing: false, rejectActiveSessionLease: true } : acpConfig,
     () => {
       const clientCfg = {
         command: bootstrap.command,
@@ -218,6 +249,9 @@ async function ensureAcpPool(
         cwd: bootstrap.verifyCwd(),
         ...(process.platform === 'win32' ? { verifyBootstrapCwd: bootstrap.verifyCwd } : {}),
         ...(spawn.env ? { env: spawn.env } : {}),
+        ...(spawn.antigravity
+          ? { inheritParentEnv: false, permissionHandler: denyAgyAcpPermission, antigravityDiagnostics: true }
+          : {}),
       };
       return acpConfig.transport === 'httpstream' ? new AcpHttpStreamClient(clientCfg) : new AcpClient(clientCfg);
     },
@@ -288,6 +322,7 @@ export async function createAcpServiceForConfig(
   // #712 P1-1: pass whitelist — MCP resolution happens at invoke time in
   // AcpAgentService so capability toggles take effect without registry rebuild.
   return new AcpAgentService({
+    ...(spawn.antigravity ? { antigravity: spawn.antigravity, agentBusyRetryDelaysMs: [] } : {}),
     catId,
     pool,
     poolKey: bootstrap.poolKey,
