@@ -1834,7 +1834,7 @@ test('third-party model: explicit null native window suppresses the effective-ca
   );
 });
 
-test('third-party model: legacy callers fall back to the effective capacity window', async () => {
+test('third-party model: absent native configuration never recycles effective capacity', async () => {
   const proc = createMockProcess();
   const spawnFn = createMockSpawnFn(proc);
   const service = createClaudeAgentService({ spawnFn, model: 'claude-test-model' });
@@ -1859,7 +1859,7 @@ test('third-party model: legacy callers fall back to the effective capacity wind
   await promise;
 
   const spawnOpts = spawnFn.mock.calls[0].arguments[2];
-  assert.equal(spawnOpts.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, '1000000');
+  assert.equal(spawnOpts.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, undefined);
 });
 
 test('native Anthropic model never receives CLAUDE_CODE_MAX_CONTEXT_TOKENS', async () => {

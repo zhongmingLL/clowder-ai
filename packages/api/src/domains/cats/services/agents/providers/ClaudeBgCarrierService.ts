@@ -333,7 +333,6 @@ export class ClaudeBgCarrierService implements AgentService {
       };
       const envOverrides = buildClaudeEnvOverrides(callbackEnvWithMode, {
         contextNativeWindowTokens: options?.contextNativeWindowTokens,
-        contextCapacity: options?.contextCapacity,
       });
       if (options?.accountEnv) {
         for (const [k, v] of Object.entries(options.accountEnv)) {

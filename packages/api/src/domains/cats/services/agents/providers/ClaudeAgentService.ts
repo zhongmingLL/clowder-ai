@@ -248,18 +248,13 @@ function removePreCompactSettingsTempDir(path: string | undefined): void {
  *   member config, because the CLI otherwise assumes its 200k default window
  */
 export interface ClaudeEnvWindowOptions {
-  /** #1381: raw/native provider window owned by member config. `null` = do not inject. */
+  /** Raw/native provider window owned by member config; never an effective session capacity. */
   contextNativeWindowTokens?: number | null;
-  /** Legacy callers without an invocation snapshot fall back to the effective window. */
-  contextCapacity?: { windowTokens: number } | null;
 }
 
 function resolveClaudeNativeWindowTokens(windowOptions?: ClaudeEnvWindowOptions): number | undefined {
-  const nativeWindowTokens =
-    windowOptions?.contextNativeWindowTokens !== undefined
-      ? windowOptions.contextNativeWindowTokens
-      : windowOptions?.contextCapacity?.windowTokens;
-  return nativeWindowTokens != null && Number.isFinite(nativeWindowTokens) && nativeWindowTokens > 0
+  const nativeWindowTokens = windowOptions?.contextNativeWindowTokens;
+  return typeof nativeWindowTokens === 'number' && Number.isSafeInteger(nativeWindowTokens) && nativeWindowTokens > 0
     ? nativeWindowTokens
     : undefined;
 }
@@ -304,16 +299,13 @@ export function buildClaudeEnvOverrides(
     if (effectiveModel && !isKnownAnthropicModel(effectiveModel)) {
       env.ANTHROPIC_MODEL = effectiveModel;
 
-      // Claude CLI only knows its native model names; for any other model it
-      // falls back to a 200k window and starts auto-compacting. With the MCP
-      // tool schema alone costing ~175k tokens, that leaves ~25k for the
-      // conversation and guarantees compaction thrashing. Pass the window the
-      // member config declares so the CLI budgets against the real model.
-      // #1381: prefer the RAW/native window — the effective/pinned capacity is
-      // downstream and feeding it back would recurse. Explicit null means this
-      // invocation has no config-owned window and nothing may be injected.
+      // Plain custom IDs can use the member-owned native window. The CLI owns
+      // recognized Claude IDs/aliases and [1m] spellings; leave those alone.
+      // https://code.claude.com/docs/en/model-config#which-ids-claude_code_max_context_tokens-applies-to
+      // Never feed a contracted effective/pinned window back into native configuration.
       const nativeWindowTokens = resolveClaudeNativeWindowTokens(windowOptions);
-      if (nativeWindowTokens !== undefined) {
+      const cliOwnedWindow = /claude-|^(?:default|best|fable|opus(?:plan)?|sonnet|haiku)$|\[1m\]/i.test(effectiveModel);
+      if (nativeWindowTokens !== undefined && !cliOwnedWindow) {
         env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(nativeWindowTokens);
       }
     }
@@ -662,7 +654,6 @@ export class ClaudeAgentService implements AgentService {
       let sawResultError = false;
       const envOverrides = buildClaudeEnvOverrides(options?.callbackEnv, {
         contextNativeWindowTokens: options?.contextNativeWindowTokens,
-        contextCapacity: options?.contextCapacity,
       });
       // F171: Account env vars applied LAST — user overrides provider-injected values
       if (options?.accountEnv) {

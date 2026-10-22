@@ -132,7 +132,6 @@ export async function prepareClaudeSdkLaunch(input: {
   const overrides = {
     ...buildClaudeEnvOverrides(options?.callbackEnv, {
       contextNativeWindowTokens: options?.contextNativeWindowTokens,
-      contextCapacity: options?.contextCapacity,
     }),
     ...options?.accountEnv,
   };
